@@ -1,0 +1,59 @@
+{
+  "seller": {
+    "login": {
+      "loginUrl": "https://seller.example.com/login",
+      "usernameSelector": "#username",
+      "usernameSubmitSelector": "button[type='submit']",
+      "passwordSelector": "#password",
+      "submitSelector": "button[type='submit']",
+      "passwordSubmitSelector": "button[type='submit']",
+      "loggedInSelector": ".seller-shell"
+    },
+    "salesUrl": "https://seller.example.com/orders",
+    "saleRowSelector": "table tbody tr",
+    "saleIdSelector": ".order-id",
+    "customerNameSelector": ".customer-name",
+    "customerDocumentSelector": ".customer-document",
+    "customerEmailSelector": ".customer-email",
+    "issuedAtSelector": ".issued-at",
+    "totalSelector": ".total-amount",
+    "detailLinkSelector": "a.details-link",
+    "detailPage": {
+      "customerNameSelector": ".customer-name",
+      "customerDocumentSelector": ".customer-document",
+      "customerEmailSelector": ".customer-email",
+      "issuedAtSelector": ".issued-at",
+      "totalSelector": ".total-amount",
+      "itemRowSelector": "table.items tbody tr",
+      "itemDescriptionSelector": ".item-description",
+      "itemQuantitySelector": ".item-quantity",
+      "itemUnitPriceSelector": ".item-unit-price",
+      "itemTotalSelector": ".item-total"
+    }
+  },
+  "sunat": {
+    "login": {
+      "loginUrl": "https://sunat.example.com/login",
+      "usernameSelector": "#usuario",
+      "usernameSubmitSelector": "button[type='submit']",
+      "passwordSelector": "#clave",
+      "submitSelector": "button[type='submit']",
+      "passwordSubmitSelector": "button[type='submit']",
+      "loggedInSelector": ".sol-shell"
+    },
+    "invoiceUrl": "https://sunat.example.com/factura",
+    "customerDocumentSelector": "#customer-document",
+    "customerNameSelector": "#customer-name",
+    "issueDateSelector": "#issue-date",
+    "currencySelector": "#currency",
+    "addItemButtonSelector": "#add-item",
+    "itemRowSelector": "#items tbody tr",
+    "itemDescriptionSelector": ".item-description",
+    "itemQuantitySelector": ".item-quantity",
+    "itemUnitPriceSelector": ".item-unit-price",
+    "finalSubmitSelector": "#submit-invoice",
+    "successSelector": ".success-banner",
+    "receiptNumberSelector": "#receipt-number",
+    "validationErrorSelector": ".validation-error"
+  }
+}

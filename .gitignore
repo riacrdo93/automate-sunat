@@ -1,0 +1,12 @@
+node_modules
+frontend/node_modules
+dist
+frontend/dist
+.env
+data
+data-smoke
+data-smoke-fresh
+coverage
+playwright-report
+test-results
+.DS_Store

@@ -1,0 +1,87 @@
+import { Card, Kbd, ScrollShadow } from "@heroui/react";
+import { useEffect, useMemo, useRef } from "react";
+import type { DashboardRunRecord } from "@shared/dashboard-contract";
+import { describeLogContext, formatLogTime, labelForLogLevel, toneForStatus } from "../lib/dashboard";
+import { StatusChip } from "./status-chip";
+
+type LogsDisclosureProps = {
+  run: DashboardRunRecord;
+  selectedStageId?: string | null;
+};
+
+export function LogsDisclosure({ run, selectedStageId }: LogsDisclosureProps) {
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const filteredLogs = useMemo(() => {
+    const stageLogs = selectedStageId ? run.logs.filter((entry) => entry.stageId === selectedStageId) : run.logs;
+
+    return stageLogs.length ? stageLogs : run.logs;
+  }, [run.logs, selectedStageId]);
+
+  useEffect(() => {
+    const node = scrollRef.current;
+
+    if (!node) {
+      return;
+    }
+
+    node.scrollTop = node.scrollHeight;
+  }, [filteredLogs]);
+
+  return (
+    <Card>
+      <Card.Header className="flex flex-col gap-3 px-5 pb-0 pt-5 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+        <div className="space-y-1">
+          <Card.Title className="text-xl tracking-tight text-default-900">Log en vivo</Card.Title>
+          <Card.Description className="text-sm leading-6 text-default-600">
+            {filteredLogs.length
+              ? `${filteredLogs.length} evento(s) capturados en tiempo real`
+              : "Todavia no hay eventos para esta corrida."}
+          </Card.Description>
+        </div>
+
+        <StatusChip tone={toneForStatus(run.status === "running" ? "active" : run.status)}>
+          {run.status === "running" ? "Stream activo" : "Ultima corrida"}
+        </StatusChip>
+      </Card.Header>
+
+      <Card.Content className="p-0">
+        <ScrollShadow ref={scrollRef} className="max-h-[460px]" hideScrollBar size={32} visibility="both">
+          <div className="space-y-3 px-5 py-5 font-mono text-[12px] leading-6 sm:px-6">
+            {filteredLogs.length ? (
+              filteredLogs.map((log, index) => {
+                const context = describeLogContext(run, log);
+
+                return (
+                  <Card key={`${log.at}-${index}`} className="font-mono">
+                    <Card.Content className="flex flex-col gap-3 px-4 py-4 font-mono">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Kbd className="font-mono">
+                          {formatLogTime(log.at)}
+                        </Kbd>
+                        <StatusChip className="font-mono" tone={log.level === "error" ? "danger" : "success"}>
+                          {labelForLogLevel(log.level)}
+                        </StatusChip>
+                        <StatusChip className="font-mono" tone="neutral">{context.stageLabel}</StatusChip>
+                        <StatusChip className="font-mono" tone="neutral">{context.stepLabel}</StatusChip>
+                        {log.saleExternalId ? <StatusChip className="font-mono" tone="neutral">{log.saleExternalId}</StatusChip> : null}
+                      </div>
+
+                      <p className="break-words font-mono text-sm leading-6 text-default-700">{log.message}</p>
+                    </Card.Content>
+                  </Card>
+                );
+              })
+            ) : (
+              <Card>
+                <Card.Content className="space-y-2 px-4 py-4 font-mono text-sm text-default-600">
+                  <p>[idle] esperando una nueva automatizacion</p>
+                  <p>[hint] aqui vas a ver cada evento del flujo en tiempo real</p>
+                </Card.Content>
+              </Card>
+            )}
+          </div>
+        </ScrollShadow>
+      </Card.Content>
+    </Card>
+  );
+}

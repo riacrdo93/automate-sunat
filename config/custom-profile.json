@@ -1,0 +1,69 @@
+{
+  "seller": {
+    "login": {
+      "loginUrl": "https://sellercenter.falabella.com/order",
+      "usernameSelector": "#email",
+      "usernameSubmitSelector": "#submit",
+      "passwordSelector": "#password",
+      "submitSelector": "button[type='submit']",
+      "passwordSubmitSelector": "button:has-text('Iniciar sesión')",
+      "loggedInSelector": "a[href*='/order/view/number/']"
+    },
+    "salesUrl": "https://sellercenter.falabella.com/order/invoice#/purchased-order-list",
+    "saleRowSelector": "tbody tr[data-row-key]",
+    "saleIdSelector": "a[href*='/order/view/number/']",
+    "issuedAtSelector": "td:nth-child(3)",
+    "detailLinkSelector": "a[href*='/order/view/number/']",
+    "detailPage": {
+      "customerNameSelector": ".card-details .row.my-1:nth-child(2) .col:last-child",
+      "customerDocumentSelector": ".card-details .row.my-1:nth-child(3) .col:last-child",
+      "issuedAtSelector": ".card-details .row.my-1:nth-child(1) .col:last-child",
+      "totalSelector": ".card-details .row.my-1 .col:last-child",
+      "itemRowSelector": "[role='row'][id^='row-']",
+      "itemDescriptionSelector": "img[alt]",
+      "itemQuantitySelector": "[data-column-id='3']",
+      "itemUnitPriceSelector": "[data-column-id='4']"
+    }
+  },
+  "sunat": {
+    "login": {
+      "loginUrl": "https://api-seguridad.sunat.gob.pe/v1/clientessol/4f3b88b3-d9d6-402a-b85d-6a0bc857746a/oauth2/loginMenuSol?lang=es-PE&showDni=true&showLanguages=false&originalUrl=https://e-menu.sunat.gob.pe/cl-ti-itmenu/AutenticaMenuInternet.htm&state=rO0ABXNyABFqYXZhLnV0aWwuSGFzaE1hcAUH2sHDFmDRAwACRgAKbG9hZEZhY3RvckkACXRocmVzaG9sZHhwP0AAAAAAAAx3CAAAABAAAAADdAADZXhlcHQABnBhcmFtc3QASyomKiYvY2wtdGktaXRtZW51L01lbnVJbnRlcm5ldC5odG0mYjY0ZDI2YThiNWFmMDkxOTIzYjIzYjY0MDdhMWMxZGI0MWU3MzNhNnQABGV4ZWNweA==",
+      "rucTabSelector": "#btnPorRuc",
+      "rucSelector": "#txtRuc",
+      "usernameSelector": "#txtUsuario",
+      "passwordSelector": "#txtContrasena",
+      "submitSelector": "#btnAceptar",
+      "loggedInSelector": "input[placeholder*='Busque'], input[placeholder*='busque']"
+    },
+    "postLoginMenuLabels": [
+      "Empresas",
+      "Comprobantes de pago",
+      "SEE - SOL",
+      "Boleta de Venta Electrónica",
+      "Emitir Boleta de Venta"
+    ],
+    "invoiceUrl": "https://e-menu.sunat.gob.pe/cl-ti-itmenu/MenuInternet.htm",
+    "customerDocumentTypeSelector": "xpath=//*[@id='inicio.tipoDocumento']",
+    "customerDocumentSelector": "#boleta\\.numeroDocumento",
+    "customerNameSelector": "#boleta\\.razonSocial",
+    "customerContinueSelector": "#boleta\\.botonGrabarDocumento_label",
+    "issueDateSelector": "#issue-date",
+    "currencySelector": "#currency",
+    "addItemButtonSelector": "span.dijitReset.dijitInline.dijitButtonText:has-text(\"Adicionar\")",
+    "itemDialogSelector": "#dialogItem",
+    "itemAcceptSelector": "#item\\.botonAceptar",
+    "itemCodeSelector": "#item\\.codigoItem",
+    "itemUnitMeasureSelector": "#item\\.unidadMedida",
+    "itemTaxedSelector": "#item\\.subTipoTB00",
+    "itemExemptSelector": "#item\\.subTipoTB01",
+    "itemUnaffectedSelector": "#item\\.subTipoTB02",
+    "itemRowSelector": "xpath=//table//tr[td]",
+    "itemDescriptionSelector": "#item\\.descripcion",
+    "itemQuantitySelector": "#item\\.cantidad",
+    "itemUnitPriceSelector": "#item\\.precioUnitario",
+    "finalSubmitSelector": "#submit-invoice",
+    "successSelector": ".sunat-success",
+    "receiptNumberSelector": "#receipt-number",
+    "validationErrorSelector": ".form-error"
+  }
+}

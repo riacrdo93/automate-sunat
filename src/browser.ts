@@ -1,0 +1,2878 @@
+import fs from "node:fs";
+import path from "node:path";
+import { Browser, BrowserContext, Download, Frame, Locator, Page, chromium } from "playwright";
+import { AppConfig } from "./config";
+import {
+  Artifact,
+  InvoiceDraft,
+  Sale,
+  SaleItem,
+  normalizeSale,
+  parseAmount,
+} from "./domain";
+import { SiteProfile } from "./profiles";
+
+export type StepReporter = (step: string) => void | Promise<void>;
+
+export interface SellerSource {
+  fetchSales(onStep: StepReporter): Promise<Sale[]>;
+  refreshSale(externalId: string, onStep: StepReporter): Promise<Sale | undefined>;
+  captureSaleEvidence(sale: Sale, attemptId: string, onStep: StepReporter): Promise<Artifact[]>;
+}
+
+export interface PreparedSubmission {
+  preSubmitArtifacts: Artifact[];
+  waitForInterruption(): Promise<string>;
+  submit(onStep: StepReporter): Promise<{
+    artifacts: Artifact[];
+    receiptNumber?: string;
+  }>;
+  cancel(onStep: StepReporter): Promise<Artifact[]>;
+}
+
+export interface InvoiceEmitter {
+  prepareSubmission(
+    attemptId: string,
+    draft: InvoiceDraft,
+    onStep: StepReporter,
+  ): Promise<PreparedSubmission>;
+}
+
+export class AutomationError extends Error {
+  constructor(message: string, public readonly artifacts: Artifact[] = []) {
+    super(message);
+    this.name = "AutomationError";
+  }
+}
+
+export class OperatorCancelledError extends AutomationError {
+  constructor(message = "Flujo cancelado porque el operador cerró el navegador.", artifacts: Artifact[] = []) {
+    super(message, artifacts);
+    this.name = "OperatorCancelledError";
+  }
+}
+
+type PageScope = Page | Frame;
+
+export function isFalabellaDocumentsUrl(url: string): boolean {
+  return /sellercenter\.falabella\.com\/order\/invoice/i.test(url);
+}
+
+export class ConfigurableSellerSource implements SellerSource {
+  constructor(
+    private readonly config: AppConfig,
+    private readonly profile: SiteProfile,
+  ) {}
+
+  async fetchSales(onStep: StepReporter): Promise<Sale[]> {
+    await onStep("Abriendo sesión del navegador para Seller");
+
+    const browser = await this.launchBrowser();
+    const context = await this.newContext(browser, "seller.json");
+    const page = await context.newPage();
+
+    try {
+      await this.loginIfNeeded(
+        page,
+        this.profile.seller.login,
+        this.config.sellerCredentials,
+        onStep,
+      );
+      await onStep("Abriendo la página de ventas del seller");
+      await page.goto(this.profile.seller.salesUrl, { waitUntil: "domcontentloaded" });
+      await page.waitForSelector(this.profile.seller.saleRowSelector);
+
+      const rowCount = await page.locator(this.profile.seller.saleRowSelector).count();
+      const sales: Sale[] = [];
+
+      for (let index = 0; index < rowCount; index += 1) {
+        const row = page.locator(this.profile.seller.saleRowSelector).nth(index);
+        const detailHref = await row
+          .locator(this.profile.seller.detailLinkSelector)
+          .first()
+          .getAttribute("href");
+
+        if (!detailHref) {
+          continue;
+        }
+
+        const externalId = await readText(row, this.profile.seller.saleIdSelector);
+        await onStep(`Leyendo la venta ${externalId} del seller`);
+        const detailUrl = new URL(detailHref, this.profile.seller.salesUrl).toString();
+        const detailPage = await context.newPage();
+
+        try {
+          await detailPage.goto(detailUrl, { waitUntil: "domcontentloaded" });
+          await detailPage.waitForSelector(this.profile.seller.detailPage.itemRowSelector);
+
+          const itemCount = await detailPage
+            .locator(this.profile.seller.detailPage.itemRowSelector)
+            .count();
+          const items: SaleItem[] = [];
+
+          for (let itemIndex = 0; itemIndex < itemCount; itemIndex += 1) {
+            const itemRow = detailPage
+              .locator(this.profile.seller.detailPage.itemRowSelector)
+              .nth(itemIndex);
+            const quantity = parseAmount(
+              await readText(itemRow, this.profile.seller.detailPage.itemQuantitySelector),
+            );
+            const unitPrice = parseAmount(
+              await readText(itemRow, this.profile.seller.detailPage.itemUnitPriceSelector),
+            );
+            const itemTotalSelector = this.profile.seller.detailPage.itemTotalSelector;
+            const total =
+              itemTotalSelector && (await itemRow.locator(itemTotalSelector).count()) > 0
+                ? parseAmount(await readText(itemRow, itemTotalSelector))
+                : quantity * unitPrice;
+
+            items.push({
+              description: await readText(
+                itemRow,
+                this.profile.seller.detailPage.itemDescriptionSelector,
+              ),
+              quantity,
+              unitPrice,
+              total,
+            });
+          }
+
+          const total = await readPreferredAmount({
+            primaryScope: row,
+            primarySelector: this.profile.seller.totalSelector,
+            fallbackScope: detailPage,
+            fallbackSelector: this.profile.seller.detailPage.totalSelector,
+          });
+          const subtotal = items.reduce((sum, item) => sum + item.total, 0);
+          sales.push(
+            normalizeSale({
+              externalId,
+              issuedAt: await readPreferredText({
+                primaryScope: row,
+                primarySelector: this.profile.seller.issuedAtSelector,
+                fallbackScope: detailPage,
+                fallbackSelector: this.profile.seller.detailPage.issuedAtSelector,
+              }),
+              currency: "PEN",
+              customer: {
+                name: await readPreferredText({
+                  primaryScope: row,
+                  primarySelector: this.profile.seller.customerNameSelector,
+                  fallbackScope: detailPage,
+                  fallbackSelector: this.profile.seller.detailPage.customerNameSelector,
+                }),
+                documentNumber: await readPreferredText({
+                  primaryScope: row,
+                  primarySelector: this.profile.seller.customerDocumentSelector,
+                  fallbackScope: detailPage,
+                  fallbackSelector: this.profile.seller.detailPage.customerDocumentSelector,
+                }),
+                email: await readPreferredOptionalText({
+                  primaryScope: row,
+                  primarySelector: this.profile.seller.customerEmailSelector,
+                  fallbackScope: detailPage,
+                  fallbackSelector: this.profile.seller.detailPage.customerEmailSelector,
+                }),
+              },
+              items,
+              totals: {
+                subtotal,
+                tax: Math.max(total - subtotal, 0),
+                total: total || subtotal,
+              },
+              raw: {
+                detailUrl,
+              },
+            }),
+          );
+        } finally {
+          await detailPage.close();
+        }
+      }
+
+      await context.storageState({ path: this.authFile("seller.json") });
+      return sales;
+    } finally {
+      await context.close();
+      await browser.close();
+    }
+  }
+
+  async refreshSale(externalId: string, onStep: StepReporter): Promise<Sale | undefined> {
+    const sales = await this.fetchSales(onStep);
+    return sales.find((sale) => sale.externalId === externalId);
+  }
+
+  async captureSaleEvidence(
+    sale: Sale,
+    attemptId: string,
+    onStep: StepReporter,
+  ): Promise<Artifact[]> {
+    const detailUrl = String(sale.raw.detailUrl ?? "");
+
+    if (!detailUrl) {
+      return [];
+    }
+
+    await onStep(`Capturando evidencia del seller para ${sale.externalId}`);
+    const browser = await this.launchBrowser();
+    const context = await this.newContext(browser, "seller.json");
+    const page = await context.newPage();
+
+    try {
+      await this.loginIfNeeded(
+        page,
+        this.profile.seller.login,
+        this.config.sellerCredentials,
+        onStep,
+      );
+      await page.goto(detailUrl, { waitUntil: "domcontentloaded" });
+
+      const screenshotPath = path.join(
+        this.config.dataPaths.screenshotsDir,
+        `${attemptId}-seller-detail.png`,
+      );
+      await page.screenshot({ path: screenshotPath, fullPage: true });
+      await context.storageState({ path: this.authFile("seller.json") });
+      return [{ kind: "screenshot", path: screenshotPath }];
+    } finally {
+      await context.close();
+      await browser.close();
+    }
+  }
+
+  private async launchBrowser(): Promise<Browser> {
+    return chromium.launch({
+      headless: !this.config.headful,
+      slowMo: this.config.slowMoMs,
+    });
+  }
+
+  private async newContext(browser: Browser, authFileName: string): Promise<BrowserContext> {
+    const authPath = this.authFile(authFileName);
+
+    if (fs.existsSync(authPath)) {
+      return browser.newContext({ storageState: authPath });
+    }
+
+    return browser.newContext();
+  }
+
+  private authFile(fileName: string): string {
+    return path.join(this.config.dataPaths.authDir, fileName);
+  }
+
+  private async loginIfNeeded(
+    page: Page,
+    login: SiteProfile["seller"]["login"],
+    credentials: { username: string; password: string },
+    onStep: StepReporter,
+  ): Promise<void> {
+    await performLoginFlow({
+      page,
+      login,
+      credentials,
+      onStep,
+      stepLabel: "Autenticando en el sitio del seller",
+    });
+  }
+}
+
+export class FalabellaSellerSource implements SellerSource {
+  constructor(private readonly config: AppConfig) {}
+
+  async fetchSales(onStep: StepReporter): Promise<Sale[]> {
+    await onStep("Abriendo Falabella Seller Center");
+
+    const browser = await launchBrowser(this.config);
+    const context = await newFalabellaContext(browser);
+    const page = await context.newPage();
+
+    try {
+      await loginToFalabella(page, this.config.sellerCredentials, onStep);
+      await openFalabellaDocumentsPage(page, this.config.sellerPurchasedOrdersUrl, onStep);
+      const orderIds = await collectFalabellaOrderIds(page);
+      const sales: Sale[] = [];
+
+      for (const orderId of orderIds) {
+        const row = await findFalabellaOrderRowByOrderId(page, orderId);
+        if (!row) {
+          continue;
+        }
+
+        const enabledOrder = await extractEnabledFalabellaRow(row, orderId);
+
+        if (!enabledOrder) {
+          continue;
+        }
+
+        if (enabledOrder.requestedDocumentType !== "Boleta") {
+          await onStep(
+            enabledOrder.requestedDocumentType
+              ? `Orden ${enabledOrder.externalId}: tipo ${enabledOrder.requestedDocumentType} detectado, se omite del flujo de boleta`
+              : `Orden ${enabledOrder.externalId}: no se pudo identificar si es boleta o factura, se omite`,
+          );
+          continue;
+        }
+
+        await onStep(`Leyendo la orden ${enabledOrder.externalId} en Falabella`);
+        const detailPage = await context.newPage();
+
+        try {
+          const sale = await readFalabellaSaleFromDetail(
+            detailPage,
+            enabledOrder,
+            this.config,
+          );
+          sales.push(sale);
+        } finally {
+          await detailPage.close().catch(() => undefined);
+        }
+      }
+      return sales;
+    } finally {
+      await context.close().catch(() => undefined);
+      await browser.close().catch(() => undefined);
+    }
+  }
+
+  async refreshSale(externalId: string, onStep: StepReporter): Promise<Sale | undefined> {
+    await onStep(`Refrescando la orden ${externalId} en Falabella`);
+
+    const browser = await launchBrowser(this.config);
+    const context = await newFalabellaContext(browser);
+    const page = await context.newPage();
+
+    try {
+      await loginToFalabella(page, this.config.sellerCredentials, onStep);
+      await openFalabellaDocumentsPage(page, this.config.sellerPurchasedOrdersUrl, onStep);
+      const row = await findFalabellaOrderRowByOrderId(page, externalId);
+
+      if (!row) {
+        return undefined;
+      }
+
+      const enabledOrder = await extractEnabledFalabellaRow(row, externalId);
+      if (!enabledOrder || enabledOrder.requestedDocumentType !== "Boleta") {
+        return undefined;
+      }
+
+      const detailPage = await context.newPage();
+      try {
+        return await readFalabellaSaleFromDetail(detailPage, enabledOrder, this.config);
+      } finally {
+        await detailPage.close().catch(() => undefined);
+      }
+    } finally {
+      await context.close().catch(() => undefined);
+      await browser.close().catch(() => undefined);
+    }
+  }
+
+  async captureSaleEvidence(
+    sale: Sale,
+    attemptId: string,
+    onStep: StepReporter,
+  ): Promise<Artifact[]> {
+    const detailUrl = String(sale.raw.detailUrl ?? "");
+
+    if (!detailUrl) {
+      return [];
+    }
+
+    await onStep(`Capturando evidencia en Falabella para ${sale.externalId}`);
+    const browser = await launchBrowser(this.config);
+    const context = await newFalabellaContext(browser);
+    const page = await context.newPage();
+
+    try {
+      await loginToFalabella(page, this.config.sellerCredentials, onStep);
+      await page.goto(detailUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      await page.getByText(/Informaci[oó]n del cliente/i).first().waitFor({
+        state: "visible",
+        timeout: 30_000,
+      });
+
+      const screenshotPath = path.join(
+        this.config.dataPaths.screenshotsDir,
+        `${attemptId}-seller-detail.png`,
+      );
+      await page.screenshot({ path: screenshotPath, fullPage: true });
+      return [{ kind: "screenshot", path: screenshotPath }];
+    } finally {
+      await context.close().catch(() => undefined);
+      await browser.close().catch(() => undefined);
+    }
+  }
+}
+
+export class SunatPortalEmitter implements InvoiceEmitter {
+  constructor(
+    private readonly config: AppConfig,
+    private readonly profile: SiteProfile,
+  ) {}
+
+  async prepareSubmission(
+    attemptId: string,
+    draft: InvoiceDraft,
+    onStep: StepReporter,
+  ): Promise<PreparedSubmission> {
+    await onStep(`Abriendo el portal SUNAT para ${draft.saleExternalId}`);
+
+    const browser = await chromium.launch({
+      headless: !this.config.headful,
+      slowMo: this.config.slowMoMs,
+    });
+    const context = await this.newContext(browser, "sunat.json");
+    const page = await context.newPage();
+    const tracePath = path.join(this.config.dataPaths.tracesDir, `${attemptId}.zip`);
+    const preSubmitScreenshot = path.join(
+      this.config.dataPaths.screenshotsDir,
+      `${attemptId}-sunat-review.png`,
+    );
+    const errorScreenshot = path.join(
+      this.config.dataPaths.screenshotsDir,
+      `${attemptId}-sunat-error.png`,
+    );
+
+    try {
+      await context.tracing.start({ screenshots: true, snapshots: true });
+      await this.loginIfNeeded(page, onStep);
+
+      if (this.profile.sunat.postLoginMenuLabels?.length) {
+        await navigateSunatSolMenu(page, this.profile.sunat.postLoginMenuLabels, onStep);
+        await waitForAnyVisibleLocatorInPageTree(
+          page,
+          customerDocumentSelectors(this.profile.sunat.customerDocumentSelector),
+          90_000,
+        );
+      } else {
+        await page.goto(this.profile.sunat.invoiceUrl, { waitUntil: "domcontentloaded" });
+      }
+
+      await onStep(`Llenando la factura SUNAT para ${draft.saleExternalId}`);
+      if (this.profile.sunat.customerDocumentTypeSelector) {
+        const documentTypeField = await tryWaitForAnyVisibleLocatorInPageTree(
+          page,
+          customerDocumentTypeSelectors(this.profile.sunat.customerDocumentTypeSelector),
+          10_000,
+        );
+        if (documentTypeField) {
+          await ensureCustomerDocumentType(documentTypeField.locator, draft.customer.documentNumber);
+        }
+      }
+
+      const customerDocumentField = await waitForAnyVisibleLocatorInPageTree(
+        page,
+        customerDocumentSelectors(this.profile.sunat.customerDocumentSelector),
+        30_000,
+      );
+      await customerDocumentField.locator.fill(draft.customer.documentNumber);
+      await customerDocumentField.locator.press("Tab").catch(() => undefined);
+      await page.waitForTimeout(3_000);
+
+      await onStep(`Validando nombre del cliente en SUNAT para ${draft.saleExternalId}`);
+      const customerNameField = await waitForAutofilledCustomerName(
+        page,
+        customerNameSelectors(this.profile.sunat.customerNameSelector),
+        draft.customer.name,
+        customerDocumentField.scope,
+        onStep,
+      );
+
+      const continueButton = await tryWaitForBottomMostVisibleLocatorInPageTree(
+        page,
+        customerContinueSelectors(this.profile.sunat.customerContinueSelector ?? "text=Continuar"),
+        10_000,
+        customerNameField.scope,
+      );
+      if (continueButton) {
+        await continueButton.locator.scrollIntoViewIfNeeded().catch(() => undefined);
+        await continueButton.locator.click();
+        await page.waitForTimeout(1_000);
+      }
+
+      if (this.profile.sunat.issueDateSelector) {
+        const issueDateField = await tryWaitForVisibleLocatorInPageTree(
+          page,
+          this.profile.sunat.issueDateSelector,
+          2_000,
+          customerNameField.scope,
+        );
+        if (issueDateField && (await issueDateField.locator.isEditable().catch(() => false))) {
+          await issueDateField.locator.fill(draft.issueDate);
+        }
+      }
+
+      if (this.profile.sunat.currencySelector) {
+        const currencyField = await tryWaitForVisibleLocatorInPageTree(
+          page,
+          this.profile.sunat.currencySelector,
+          2_000,
+          customerNameField.scope,
+        );
+        if (currencyField) {
+          await currencyField.locator.selectOption(draft.currency).catch(() => undefined);
+        }
+      }
+
+      if (this.profile.sunat.itemDialogSelector && this.profile.sunat.itemAcceptSelector) {
+        await addItemsViaSunatModal(
+          page,
+          customerNameField.scope,
+          draft,
+          this.profile,
+          onStep,
+        );
+      } else {
+        await ensureRowCount(
+          customerNameField.scope,
+          this.profile.sunat.itemRowSelector,
+          draft.items.length,
+          this.profile.sunat.addItemButtonSelector,
+        );
+
+        for (let index = 0; index < draft.items.length; index += 1) {
+          const row = customerNameField.scope.locator(this.profile.sunat.itemRowSelector).nth(index);
+          const item = draft.items[index];
+
+          await row.locator(this.profile.sunat.itemDescriptionSelector).fill(item.description);
+          await row
+            .locator(this.profile.sunat.itemQuantitySelector)
+            .fill(String(item.quantity));
+          await row
+            .locator(this.profile.sunat.itemUnitPriceSelector)
+            .fill(String(item.unitPrice));
+        }
+      }
+
+      await continueSunatBoletaWizard(page, this.profile, onStep);
+      await page.screenshot({ path: preSubmitScreenshot, fullPage: true });
+
+      return new PendingSunatSubmission({
+        attemptId,
+        draft,
+        browser,
+        context,
+        page,
+        tracePath,
+        profile: this.profile,
+        preSubmitArtifacts: [{ kind: "screenshot", path: preSubmitScreenshot }],
+        config: this.config,
+        onStep,
+      });
+    } catch (error) {
+      const artifacts: Artifact[] = [];
+      if (!page.isClosed()) {
+        await page.screenshot({ path: errorScreenshot, fullPage: true }).catch(() => undefined);
+        if (fs.existsSync(errorScreenshot)) {
+          artifacts.push({ kind: "screenshot", path: errorScreenshot });
+        }
+      }
+      await stopTraceSafely(context, tracePath, artifacts);
+      await context.close().catch(() => undefined);
+      await browser.close().catch(() => undefined);
+      throw normalizeAutomationError(error, artifacts);
+    }
+  }
+
+  private async loginIfNeeded(page: Page, onStep: StepReporter): Promise<void> {
+    await performLoginFlow({
+      page,
+      login: this.profile.sunat.login,
+      credentials: this.config.sunatCredentials,
+      onStep,
+      stepLabel: "Autenticando en SUNAT",
+    });
+  }
+
+  private async newContext(browser: Browser, authFileName: string): Promise<BrowserContext> {
+    const authPath = path.join(this.config.dataPaths.authDir, authFileName);
+
+    if (fs.existsSync(authPath)) {
+      return browser.newContext({ storageState: authPath });
+    }
+
+    return browser.newContext();
+  }
+}
+
+class PendingSunatSubmission implements PreparedSubmission {
+  private cleanupStarted = false;
+  private readonly interruptionSignal: Promise<string>;
+  private resolveInterruption?: (message: string) => void;
+
+  constructor(
+    private readonly params: {
+      attemptId: string;
+      draft: InvoiceDraft;
+      browser: Browser;
+      context: BrowserContext;
+      page: Page;
+      tracePath: string;
+      profile: SiteProfile;
+      preSubmitArtifacts: Artifact[];
+      config: AppConfig;
+      onStep: StepReporter;
+    },
+  ) {
+    this.interruptionSignal = new Promise<string>((resolve) => {
+      this.resolveInterruption = resolve;
+    });
+
+    const notifyOperatorClosure = () => {
+      if (this.cleanupStarted) {
+        return;
+      }
+
+      this.resolveInterruption?.("Flujo cancelado porque el operador cerró el navegador.");
+    };
+
+    this.params.page.once("close", notifyOperatorClosure);
+    this.params.browser.once("disconnected", notifyOperatorClosure);
+  }
+
+  get preSubmitArtifacts(): Artifact[] {
+    return this.params.preSubmitArtifacts;
+  }
+
+  waitForInterruption(): Promise<string> {
+    return this.interruptionSignal;
+  }
+
+  async submit(onStep: StepReporter): Promise<{ artifacts: Artifact[]; receiptNumber?: string }> {
+    const confirmationScreenshot = path.join(
+      this.params.config.dataPaths.screenshotsDir,
+      `${this.params.attemptId}-sunat-confirmation.png`,
+    );
+    const artifacts: Artifact[] = [];
+
+    try {
+      await onStep("Enviando factura en SUNAT");
+      await continueSunatBoletaWizard(this.params.page, this.params.profile, onStep);
+
+      const submitButton = await waitForVisibleLocatorInPageTree(
+        this.params.page,
+        this.params.profile.sunat.finalSubmitSelector,
+        30_000,
+      );
+      await submitButton.locator.click();
+      await this.params.page.waitForTimeout(750);
+
+      if (this.params.profile.sunat.confirmAcceptSelector) {
+        const acceptButton = await tryWaitForVisibleLocatorInPageTree(
+          this.params.page,
+          this.params.profile.sunat.confirmAcceptSelector,
+          10_000,
+        );
+        if (acceptButton) {
+          await acceptButton.locator.click();
+        }
+      }
+
+      await this.params.page.waitForLoadState("domcontentloaded").catch(() => undefined);
+
+      if (
+        this.params.profile.sunat.validationErrorSelector &&
+        (await this.params.page
+          .locator(this.params.profile.sunat.validationErrorSelector)
+          .count()) > 0
+      ) {
+        const validation = await this.params.page
+          .locator(this.params.profile.sunat.validationErrorSelector)
+          .first()
+          .textContent();
+        throw new AutomationError(validation?.trim() || "SUNAT devolvió un error de validación.", artifacts);
+      }
+
+      await waitForVisibleLocatorInPageTree(
+        this.params.page,
+        this.params.profile.sunat.successSelector,
+        30_000,
+      );
+      await this.params.page.screenshot({ path: confirmationScreenshot, fullPage: true });
+      artifacts.push({ kind: "screenshot", path: confirmationScreenshot });
+      await this.params.context.storageState({
+        path: path.join(this.params.config.dataPaths.authDir, "sunat.json"),
+      });
+
+      const receiptNumber = await readSunatReceiptNumber(this.params.page, this.params.profile);
+      const downloadedFiles = await downloadSunatReceiptFiles(
+        this.params.page,
+        this.params.profile,
+        this.params.config,
+        this.params.draft.saleExternalId,
+        this.params.draft.customer.documentNumber,
+        receiptNumber,
+      );
+      artifacts.push(...downloadedFiles.map((path) => ({ kind: "file" as const, path })));
+
+      await stopTraceSafely(this.params.context, this.params.tracePath, artifacts);
+
+      if (this.params.profile.sunat.closeSuccessSelector) {
+        const closeButton = await tryWaitForVisibleLocatorInPageTree(
+          this.params.page,
+          this.params.profile.sunat.closeSuccessSelector,
+          5_000,
+        );
+        if (closeButton) {
+          await closeButton.locator.click().catch(() => undefined);
+        }
+      }
+
+      await this.cleanup();
+
+      return {
+        artifacts,
+        receiptNumber,
+      };
+    } catch (error) {
+      const failureScreenshot = path.join(
+        this.params.config.dataPaths.screenshotsDir,
+        `${this.params.attemptId}-sunat-submit-error.png`,
+      );
+      await this.params.page
+        .screenshot({ path: failureScreenshot, fullPage: true })
+        .catch(() => undefined);
+      if (fs.existsSync(failureScreenshot)) {
+        artifacts.push({ kind: "screenshot", path: failureScreenshot });
+      }
+      await stopTraceSafely(this.params.context, this.params.tracePath, artifacts);
+      await this.cleanup();
+      throw normalizeAutomationError(error, artifacts);
+    }
+  }
+
+  async cancel(onStep: StepReporter): Promise<Artifact[]> {
+    const cancellationScreenshot = path.join(
+      this.params.config.dataPaths.screenshotsDir,
+      `${this.params.attemptId}-sunat-cancelled.png`,
+    );
+    const artifacts: Artifact[] = [];
+
+    await onStep("Cancelando el envío pendiente en SUNAT");
+    await this.params.page.screenshot({ path: cancellationScreenshot, fullPage: true }).catch(() => undefined);
+
+    if (fs.existsSync(cancellationScreenshot)) {
+      artifacts.push({ kind: "screenshot", path: cancellationScreenshot });
+    }
+
+    await stopTraceSafely(this.params.context, this.params.tracePath, artifacts);
+    await this.cleanup();
+    return artifacts;
+  }
+
+  private async cleanup(): Promise<void> {
+    this.cleanupStarted = true;
+    if (!this.params.page.isClosed()) {
+      await this.params.page.close().catch(() => undefined);
+    }
+    await this.params.context.close().catch(() => undefined);
+    await this.params.browser.close().catch(() => undefined);
+  }
+}
+
+type FalabellaRowCandidate = {
+  externalId: string;
+  detailUrl: string;
+  issuedAt: string;
+  documentProgress: string;
+  uploadedDocuments: number;
+  totalDocuments: number;
+  requestedDocumentType?: string;
+  itemDocumentTypes: Array<{
+    description: string;
+    documentType?: string;
+  }>;
+};
+
+const FALABELLA_LOCAL_STORAGE_ENTRIES = [
+  ["user-coach-mark", "4"],
+  [
+    "common-coach-mark",
+    JSON.stringify([
+      ".support-coachmark",
+      ".col_0_0",
+      ".col_0_2",
+      ".col_1_0",
+      ".col_2_0",
+      ".col_3_0",
+    ]),
+  ],
+] as const;
+
+async function launchBrowser(config: AppConfig): Promise<Browser> {
+  return chromium.launch({
+    headless: !config.headful,
+    slowMo: config.slowMoMs,
+  });
+}
+
+async function newFalabellaContext(browser: Browser): Promise<BrowserContext> {
+  const context = await browser.newContext({ viewport: { width: 1600, height: 1000 } });
+  await context.addInitScript((entries) => {
+    if (!window.location.hostname.includes("sellercenter.falabella.com")) {
+      return;
+    }
+
+    for (const [key, value] of entries) {
+      window.localStorage.setItem(key, value);
+    }
+  }, FALABELLA_LOCAL_STORAGE_ENTRIES);
+
+  return context;
+}
+
+async function loginToFalabella(
+  page: Page,
+  credentials: { username: string; password: string },
+  onStep: StepReporter,
+): Promise<void> {
+  await onStep("Autenticando en Falabella Seller Center");
+  await page.goto("https://sellercenter.falabella.com/order", {
+    waitUntil: "domcontentloaded",
+    timeout: 60_000,
+  });
+  await persistFalabellaLocalStorage(page);
+  const omitButton = page.getByRole("button", { name: /Omitir/i }).first();
+  const emailField = page.locator("#email").first();
+  const passwordField = page.locator("#password").first();
+  const ordersMenu = page.getByRole("link", { name: /Órdenes/i }).first();
+
+  await Promise.race([
+    emailField.waitFor({ state: "visible", timeout: 20_000 }).catch(() => undefined),
+    passwordField.waitFor({ state: "visible", timeout: 20_000 }).catch(() => undefined),
+    omitButton.waitFor({ state: "visible", timeout: 20_000 }).catch(() => undefined),
+    ordersMenu.waitFor({ state: "visible", timeout: 20_000 }).catch(() => undefined),
+  ]);
+
+  if (await omitButton.isVisible().catch(() => false)) {
+    await dismissFalabellaPopup(page);
+    return;
+  }
+
+  if (await emailField.isVisible().catch(() => false)) {
+    await emailField.fill(credentials.username);
+    await page.locator("#submit").first().click({ noWaitAfter: true }).catch(() => undefined);
+    await passwordField.waitFor({ state: "visible", timeout: 30_000 }).catch(() => undefined);
+  }
+
+  if (await passwordField.isVisible().catch(() => false)) {
+    await passwordField.fill(credentials.password);
+    await page.waitForTimeout(1_000);
+
+    const signInButton = page.getByRole("button", { name: /Iniciar sesi[oó]n/i }).first();
+    await signInButton.click({ noWaitAfter: true }).catch(() => undefined);
+    await page.waitForTimeout(2_500);
+
+    if (await passwordField.isVisible().catch(() => false)) {
+      await signInButton.click({ noWaitAfter: true }).catch(() => undefined);
+    }
+  }
+
+  await Promise.race([
+    omitButton.waitFor({ state: "visible", timeout: 20_000 }).catch(() => undefined),
+    ordersMenu.waitFor({ state: "visible", timeout: 20_000 }).catch(() => undefined),
+  ]);
+  await page.waitForTimeout(2_000);
+  await dismissFalabellaPopup(page);
+}
+
+async function dismissFalabellaPopup(page: Page): Promise<void> {
+  const omitButton = page.getByRole("button", { name: /Omitir/i }).first();
+  if (await omitButton.isVisible().catch(() => false)) {
+    await omitButton.click({ noWaitAfter: true }).catch(() => undefined);
+    await page.waitForTimeout(1_000);
+  }
+}
+
+async function openFalabellaDocumentsPage(
+  page: Page,
+  url: string,
+  onStep: StepReporter,
+): Promise<void> {
+  await onStep("Abriendo Documentos tributarios en Falabella");
+
+  const ordersMenu = page.getByRole("link", { name: /Órdenes/i }).first();
+  const documentsOption = page.getByRole("link", { name: /Documentos tributarios/i }).first();
+
+  if (await ordersMenu.isVisible().catch(() => false)) {
+    await ordersMenu.hover().catch(() => undefined);
+    await page.waitForTimeout(600);
+  }
+
+  if (await documentsOption.isVisible().catch(() => false)) {
+    await documentsOption.click({ noWaitAfter: true }).catch(() => undefined);
+    await page.waitForTimeout(8_000);
+  } else {
+    await page.goto(url, {
+      waitUntil: "domcontentloaded",
+      timeout: 60_000,
+    });
+    await persistFalabellaLocalStorage(page);
+    await page.waitForTimeout(8_000);
+  }
+
+  if (!(await page.locator("tbody tr[data-row-key]").first().isVisible().catch(() => false))) {
+    await page.goto(url, {
+      waitUntil: "domcontentloaded",
+      timeout: 60_000,
+    });
+    await persistFalabellaLocalStorage(page);
+    await page.waitForTimeout(10_000);
+  }
+
+  await page.locator("tbody tr[data-row-key]").first().waitFor({ state: "visible", timeout: 30_000 });
+}
+
+async function collectFalabellaOrderIds(page: Page): Promise<string[]> {
+  const rows = page.locator("tbody tr[data-row-key]");
+  await rows.first().waitFor({ state: "visible", timeout: 30_000 });
+  const count = await rows.count();
+  const orderIds: string[] = [];
+
+  for (let index = 0; index < count; index += 1) {
+    const row = rows.nth(index);
+    const orderId = await row
+      .locator("a[href*='/order/view/number/']")
+      .first()
+      .textContent({ timeout: 1_000 })
+      .catch(() => "");
+    const externalId = ((orderId ?? "").match(/\d+/)?.[0] ?? "").trim();
+
+    if (externalId) {
+      orderIds.push(externalId);
+    }
+  }
+
+  return Array.from(new Set(orderIds));
+}
+
+async function findFalabellaOrderRowByOrderId(page: Page, orderId: string): Promise<Locator | undefined> {
+  const row = page
+    .locator("tbody tr[data-row-key]")
+    .filter({
+      has: page.locator("a[href*='/order/view/number/']", {
+        hasText: orderId,
+      }),
+    })
+    .first();
+
+  const visible = await row.isVisible().catch(() => false);
+  return visible ? row : undefined;
+}
+
+async function extractEnabledFalabellaRow(
+  row: Locator,
+  expectedOrderId?: string,
+): Promise<FalabellaRowCandidate | undefined> {
+  const orderLink = row.locator("a[href*='/order/view/number/']").first();
+  const detailUrl = await orderLink.getAttribute("href", { timeout: 1_000 }).catch(() => null);
+
+  if (!detailUrl) {
+    return undefined;
+  }
+
+  const button = row.locator("button.uploadbtn").first();
+  const disabled =
+    (await button.isDisabled().catch(() => false)) ||
+    (await button.getAttribute("disabled").catch(() => null)) !== null;
+
+  const documentProgress = ((await row.locator("td").nth(4).textContent().catch(() => "")) ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const counts = parseFalabellaDocumentProgress(documentProgress);
+
+  if (disabled || !counts || counts.uploaded >= counts.total) {
+    return undefined;
+  }
+
+  const externalId = (((await orderLink.textContent().catch(() => "")) ?? "").match(/\d+/)?.[0] ?? "").trim();
+  const issuedAt = ((await row.locator("td").nth(2).textContent().catch(() => "")) ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!externalId || (expectedOrderId && externalId !== expectedOrderId)) {
+    return undefined;
+  }
+
+  const itemDocumentTypes = await readFalabellaExpandedItemDocumentTypes(row);
+  const requestedDocumentType = summarizeFalabellaDocumentTypeEntries(itemDocumentTypes);
+
+  return {
+    externalId,
+    detailUrl,
+    issuedAt,
+    documentProgress: counts.raw,
+    uploadedDocuments: counts.uploaded,
+    totalDocuments: counts.total,
+    requestedDocumentType,
+    itemDocumentTypes,
+  };
+}
+
+async function readFalabellaSaleFromDetail(
+  detailPage: Page,
+  row: FalabellaRowCandidate,
+  config: AppConfig,
+): Promise<Sale> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await detailPage.goto(row.detailUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: 60_000,
+    });
+    await detailPage.getByText(/Informaci[oó]n del cliente/i).first().waitFor({
+      state: "visible",
+      timeout: 30_000,
+    });
+    await detailPage.locator(".card-details .row.my-1").first().waitFor({
+      state: "visible",
+      timeout: 15_000,
+    });
+    await detailPage.waitForTimeout(attempt === 0 ? 2_000 : 4_000);
+
+    const detailMap = await readFalabellaDetailMap(detailPage);
+    const total = parseAmount(
+      detailMap["gran total"] ?? detailMap["productos incluidos impuestos"] ?? "",
+    );
+    const issuedAt = normalizeFalabellaIssuedAt(detailMap.fecha ?? row.issuedAt);
+    const productCount = await readFalabellaProductCount(detailPage, row.itemDocumentTypes.length);
+    const productDescription = await readFalabellaPrimaryProductDescription(detailPage, row.itemDocumentTypes);
+    const computedTotal = total;
+    const customerName = detailMap.cliente ?? "Cliente sin nombre";
+    const documentNumber =
+      detailMap["n identificacion"] ??
+      detailMap["numero identificacion"] ??
+      "";
+
+    if (customerName !== "Cliente sin nombre" && documentNumber && productCount > 0 && computedTotal > 0) {
+      const { baseAmount, taxAmount } = splitIgv(computedTotal);
+      const aggregateItem = buildFalabellaBoletaAggregateItem(
+        row.externalId,
+        productDescription,
+        productCount,
+        computedTotal,
+      );
+
+      return normalizeSale({
+        externalId: row.externalId,
+        issuedAt,
+        currency: "PEN",
+        customer: {
+          name: customerName,
+          documentNumber,
+        },
+        items: [aggregateItem],
+        totals: {
+          subtotal: baseAmount,
+          tax: taxAmount,
+          total: computedTotal,
+        },
+        raw: {
+          source: "falabella",
+          detailUrl: row.detailUrl,
+          dashboardUrl: config.sellerPurchasedOrdersUrl,
+          documentProgress: row.documentProgress,
+          requestedDocumentType: row.requestedDocumentType,
+          productCount,
+          uploadedDocuments: row.uploadedDocuments,
+          totalDocuments: row.totalDocuments,
+          falabellaIssuedAt: detailMap.fecha ?? row.issuedAt,
+        },
+      });
+    }
+  }
+
+  throw new Error(`No se pudo leer el detalle completo de la orden ${row.externalId}.`);
+}
+
+async function persistFalabellaLocalStorage(page: Page): Promise<void> {
+  await page.evaluate((entries) => {
+    for (const [key, value] of entries) {
+      window.localStorage.setItem(key, value);
+    }
+  }, FALABELLA_LOCAL_STORAGE_ENTRIES).catch(() => undefined);
+}
+
+async function readFalabellaDetailMap(page: Page): Promise<Record<string, string>> {
+  const rows = await page.locator(".card-details .row.my-1").evaluateAll((elements) =>
+    elements.map((element) => {
+      const columns = Array.from(element.querySelectorAll(":scope > div"));
+      if (columns.length < 2) {
+        return { label: "", value: "" };
+      }
+
+      return {
+        label: (columns[0].textContent || "").replace(/\s+/g, " ").trim(),
+        value: (columns[1].textContent || "").replace(/\s+/g, " ").trim(),
+      };
+    }),
+  );
+
+  const map: Record<string, string> = {};
+
+  for (const row of rows) {
+    if (!row.label) {
+      continue;
+    }
+    map[normalizeDetailLabel(row.label)] = row.value;
+  }
+
+  return map;
+}
+
+async function readFalabellaProductCount(
+  detailPage: Page,
+  fallbackCount: number,
+): Promise<number> {
+  if (fallbackCount > 0) {
+    return fallbackCount;
+  }
+
+  const detailCount = await detailPage.locator('[role="row"][id^="row-"]').count().catch(() => 0);
+  return Math.max(detailCount, 0);
+}
+
+async function readFalabellaPrimaryProductDescription(
+  detailPage: Page,
+  documentEntries: Array<{ description: string; documentType?: string }>,
+): Promise<string> {
+  const detailDescription = await detailPage
+    .locator('[role="row"][id^="row-"] img[alt], [role="row"][id^="row-"] p.fw-700')
+    .first()
+    .evaluate((element) => {
+      if (element instanceof HTMLImageElement) {
+        return element.alt.trim();
+      }
+      return (element.textContent || "").replace(/\s+/g, " ").trim();
+    })
+    .catch(() => "");
+
+  if (detailDescription) {
+    return detailDescription;
+  }
+
+  const firstDocumentDescription = documentEntries.find((entry) => entry.description)?.description?.trim();
+  if (firstDocumentDescription) {
+    return firstDocumentDescription;
+  }
+
+  return `PRODUCTO ORDEN ${Date.now()}`;
+}
+
+function buildFalabellaBoletaAggregateItem(
+  externalId: string,
+  description: string,
+  productCount: number,
+  total: number,
+): SaleItem {
+  const quantity = Math.max(productCount, 1);
+  const lineTotal = roundCurrency(total);
+
+  return {
+    description: description || `PRODUCTO ORDEN ${externalId}`,
+    quantity,
+    unitPrice: quantity > 0 ? roundCurrency(lineTotal / quantity) : lineTotal,
+    total: lineTotal,
+    documentType: "Boleta",
+  };
+}
+
+async function readFalabellaItems(
+  page: Page,
+  documentEntries: Array<{ description: string; documentType?: string }> = [],
+): Promise<SaleItem[]> {
+  const rows = await page.locator('[role="row"][id^="row-"]').evaluateAll((elements) =>
+    elements
+      .map((element) => {
+        const description =
+          element.querySelector("img[alt]")?.getAttribute("alt")?.trim() ||
+          element.querySelector("p.fw-700")?.textContent?.replace(/\s+/g, " ").trim() ||
+          "";
+
+        if (!description) {
+          return null;
+        }
+
+        const quantityText =
+          element
+            .querySelector('[data-column-id="3"] [data-tag="allowRowEvents"], [data-column-id="3"]')
+            ?.textContent?.replace(/\s+/g, " ")
+            .trim() || "";
+        const priceText =
+          element.querySelector('[data-column-id="4"] p')?.textContent?.replace(/\s+/g, " ").trim() ||
+          element.querySelector('[data-column-id="4"]')?.textContent?.replace(/\s+/g, " ").trim() ||
+          "";
+
+        return {
+          description,
+          quantityText,
+          priceText,
+        };
+      })
+      .filter((entry): entry is { description: string; quantityText: string; priceText: string } => Boolean(entry)),
+  );
+
+  const documentTypesByDescription = new Map<string, string[]>();
+  for (const entry of documentEntries) {
+    const key = normalizeFalabellaItemLabel(entry.description);
+    if (!key || !entry.documentType) {
+      continue;
+    }
+    const bucket = documentTypesByDescription.get(key) ?? [];
+    bucket.push(entry.documentType);
+    documentTypesByDescription.set(key, bucket);
+  }
+  const fallbackDocumentType = summarizeSingleFalabellaDocumentType(documentEntries);
+
+  return rows.map((row) => {
+    const quantity = Math.max(parseAmount(row.quantityText), 1);
+    const lineTotal = parseAmount(row.priceText);
+    const unitPrice = quantity > 0 ? roundCurrency(lineTotal / quantity) : lineTotal;
+    const documentType =
+      consumeFalabellaItemDocumentType(documentTypesByDescription, row.description) ?? fallbackDocumentType;
+
+    return {
+      description: row.description,
+      quantity,
+      unitPrice,
+      total: lineTotal || roundCurrency(unitPrice * quantity),
+      documentType,
+    };
+  });
+}
+
+async function readFalabellaExpandedItemDocumentTypes(
+  row: Locator,
+): Promise<Array<{ description: string; documentType?: string }>> {
+  const expandedRow = row.locator("xpath=following-sibling::tr[1]");
+  let toggle: Locator | null = null;
+  let expandedByAutomation = false;
+
+  if (!(await hasFalabellaExpandedDocumentTable(expandedRow))) {
+    toggle = await findFalabellaExpandToggle(row);
+    if (toggle) {
+      await toggle.click().catch(() => undefined);
+      await row.page().waitForTimeout(800);
+      expandedByAutomation = true;
+    }
+  }
+
+  if (!(await hasFalabellaExpandedDocumentTable(expandedRow))) {
+    return [];
+  }
+
+  const entries = await expandedRow.evaluate((element) => {
+    const tables = Array.from(element.querySelectorAll("table"));
+
+    for (const table of tables) {
+      const headers = Array.from(table.querySelectorAll("th")).map((header) =>
+        (header.textContent || "").replace(/\s+/g, " ").trim(),
+      );
+      const productIndex = headers.findIndex((header) => /producto/i.test(header));
+      const documentTypeIndex = headers.findIndex((header) => /tipo documento/i.test(header));
+
+      if (productIndex === -1 || documentTypeIndex === -1) {
+        continue;
+      }
+
+      const rows = Array.from(table.querySelectorAll("tbody tr"));
+      const entries = rows
+        .map((tableRow) =>
+          Array.from(tableRow.querySelectorAll("td")).map((cell) =>
+            (cell.textContent || "").replace(/\s+/g, " ").trim(),
+          ),
+        )
+        .filter((cells) => cells.length > documentTypeIndex)
+        .map((cells) => ({
+          description: cells[productIndex] || "",
+          documentType: cells[documentTypeIndex] || undefined,
+        }))
+        .filter((entry) => entry.description);
+
+      if (entries.length) {
+        return entries;
+      }
+    }
+
+    return [];
+  });
+
+  if (expandedByAutomation) {
+    const collapseToggle = toggle ?? (await findFalabellaExpandToggle(row));
+    if (collapseToggle) {
+      await collapseToggle.click().catch(() => undefined);
+      await row.page().waitForTimeout(400);
+    }
+  }
+
+  return entries;
+}
+
+async function hasFalabellaExpandedDocumentTable(expandedRow: Locator): Promise<boolean> {
+  const typeHeader = expandedRow.getByText(/Tipo Documento/i).first();
+  return typeHeader.isVisible().catch(() => false);
+}
+
+async function findFalabellaExpandToggle(row: Locator): Promise<Locator | null> {
+  const candidates = [
+    row.locator(".ant-table-row-expand-icon").first(),
+    row.locator("td").first().locator("button").first(),
+    row.locator("td").first().locator("[role='button']").first(),
+    row.locator("td").first(),
+  ];
+
+  for (const candidate of candidates) {
+    if (await candidate.isVisible().catch(() => false)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+function parseFalabellaDocumentProgress(raw: string): { uploaded: number; total: number; raw: string } | undefined {
+  const cleaned = raw.replace(/\s+/g, " ").trim();
+  const match = cleaned.match(/(\d+)\s+de\s+(\d+)/i);
+
+  if (!match) {
+    return undefined;
+  }
+
+  return {
+    uploaded: Number(match[1]),
+    total: Number(match[2]),
+    raw: `${match[1]} de ${match[2]}`,
+  };
+}
+
+function normalizeDetailLabel(raw: string): string {
+  return raw
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function normalizeFalabellaItemLabel(raw: string): string {
+  return raw
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function normalizeFalabellaDocumentType(raw: string | undefined): string | undefined {
+  const value = (raw || "").replace(/\s+/g, " ").trim();
+  const normalized = normalizeFalabellaItemLabel(value);
+
+  if (!normalized) {
+    return undefined;
+  }
+
+  if (normalized.includes("factura")) {
+    return "Factura";
+  }
+
+  if (normalized.includes("boleta")) {
+    return "Boleta";
+  }
+
+  return value;
+}
+
+function consumeFalabellaItemDocumentType(
+  documentTypesByDescription: Map<string, string[]>,
+  description: string,
+): string | undefined {
+  const key = normalizeFalabellaItemLabel(description);
+  const bucket = documentTypesByDescription.get(key);
+
+  if (!bucket?.length) {
+    return undefined;
+  }
+
+  const documentType = normalizeFalabellaDocumentType(bucket.shift());
+
+  if (!bucket.length) {
+    documentTypesByDescription.delete(key);
+  }
+
+  return documentType;
+}
+
+function summarizeFalabellaDocumentTypes(items: SaleItem[]): string | undefined {
+  const uniqueTypes = Array.from(
+    new Set(items.map((item) => normalizeFalabellaDocumentType(item.documentType)).filter(Boolean)),
+  );
+
+  if (!uniqueTypes.length) {
+    return undefined;
+  }
+
+  return uniqueTypes.join(", ");
+}
+
+function summarizeFalabellaDocumentTypeEntries(
+  entries: Array<{ description: string; documentType?: string }>,
+): string | undefined {
+  const uniqueTypes = Array.from(
+    new Set(entries.map((entry) => normalizeFalabellaDocumentType(entry.documentType)).filter(Boolean)),
+  );
+
+  if (!uniqueTypes.length) {
+    return undefined;
+  }
+
+  return uniqueTypes.join(", ");
+}
+
+function summarizeSingleFalabellaDocumentType(
+  entries: Array<{ description: string; documentType?: string }>,
+): string | undefined {
+  const summary = summarizeFalabellaDocumentTypeEntries(entries);
+  if (!summary || summary.includes(",")) {
+    return undefined;
+  }
+
+  return summary;
+}
+
+function normalizeFalabellaIssuedAt(raw: string): string {
+  const value = raw.replace(/\s+/g, " ").trim();
+
+  if (!value) {
+    return new Date().toISOString();
+  }
+
+  const slashDate = value.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+  if (slashDate) {
+    const [, day, month, year] = slashDate;
+    return `${year}-${month}-${day}T00:00:00-05:00`;
+  }
+
+  const monthDate = value.match(/([A-Za-z]{3})\s+(\d{1,2}),\s+(\d{4})(?:\s+(\d{1,2}):(\d{2}))?/);
+  if (monthDate) {
+    const [, rawMonth, rawDay, year, hours = "00", minutes = "00"] = monthDate;
+    const month = monthTokenToNumber(rawMonth);
+    const day = rawDay.padStart(2, "0");
+    return `${year}-${month}-${day}T${hours.padStart(2, "0")}:${minutes}:00-05:00`;
+  }
+
+  const parsed = new Date(value);
+  if (!Number.isNaN(parsed.getTime())) {
+    return parsed.toISOString();
+  }
+
+  return new Date().toISOString();
+}
+
+function monthTokenToNumber(token: string): string {
+  const months: Record<string, string> = {
+    jan: "01",
+    ene: "01",
+    feb: "02",
+    mar: "03",
+    apr: "04",
+    abr: "04",
+    may: "05",
+    jun: "06",
+    jul: "07",
+    aug: "08",
+    ago: "08",
+    sep: "09",
+    set: "09",
+    oct: "10",
+    nov: "11",
+    dec: "12",
+    dic: "12",
+  };
+
+  return months[token.toLowerCase()] ?? "01";
+}
+
+function roundCurrency(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+export function splitIgv(total: number): { baseAmount: number; taxAmount: number } {
+  if (!total) {
+    return { baseAmount: 0, taxAmount: 0 };
+  }
+
+  const baseAmount = total / 1.18;
+  return {
+    baseAmount,
+    taxAmount: total - baseAmount,
+  };
+}
+
+async function readText(scope: Page | Locator, selector: string): Promise<string> {
+  const locator = scope.locator(selector).first();
+  const text = await locator.textContent();
+  return text?.trim() ?? "";
+}
+
+async function readOptionalText(
+  scope: Page | Locator,
+  selector?: string,
+): Promise<string | undefined> {
+  if (!selector) {
+    return undefined;
+  }
+
+  const locator = scope.locator(selector).first();
+  const count = await locator.count().catch(() => 0);
+
+  if (count === 0) {
+    return undefined;
+  }
+
+  const text = await locator.textContent().catch(() => null);
+  return text?.trim() || undefined;
+}
+
+async function readPreferredText(params: {
+  primaryScope: Page | Locator;
+  primarySelector?: string;
+  fallbackScope: Page | Locator;
+  fallbackSelector?: string;
+}): Promise<string> {
+  const primaryValue = await readOptionalText(params.primaryScope, params.primarySelector);
+
+  if (primaryValue) {
+    return primaryValue;
+  }
+
+  return (await readOptionalText(params.fallbackScope, params.fallbackSelector)) ?? "";
+}
+
+async function readPreferredOptionalText(params: {
+  primaryScope: Page | Locator;
+  primarySelector?: string;
+  fallbackScope: Page | Locator;
+  fallbackSelector?: string;
+}): Promise<string | undefined> {
+  const primaryValue = await readOptionalText(params.primaryScope, params.primarySelector);
+
+  if (primaryValue) {
+    return primaryValue;
+  }
+
+  return readOptionalText(params.fallbackScope, params.fallbackSelector);
+}
+
+async function readPreferredAmount(params: {
+  primaryScope: Page | Locator;
+  primarySelector?: string;
+  fallbackScope: Page | Locator;
+  fallbackSelector?: string;
+}): Promise<number> {
+  const value = await readPreferredText(params);
+  return parseAmount(value);
+}
+
+async function performLoginFlow(params: {
+  page: Page;
+  login: SiteProfile["seller"]["login"] | SiteProfile["sunat"]["login"];
+  credentials: { username: string; password: string; ruc?: string };
+  onStep: StepReporter;
+  stepLabel: string;
+}): Promise<void> {
+  const { page, login, credentials, onStep, stepLabel } = params;
+
+  await page.goto(login.loginUrl, { waitUntil: "domcontentloaded" });
+
+  if (await isLoggedIn(page, login.loggedInSelector)) {
+    return;
+  }
+
+  const usernameField = page.locator(login.usernameSelector).first();
+  const passwordField = page.locator(login.passwordSelector).first();
+  const shouldLogin =
+    (await usernameField.isVisible().catch(() => false)) ||
+    (await passwordField.isVisible().catch(() => false));
+
+  if (!shouldLogin) {
+    return;
+  }
+
+  await onStep(stepLabel);
+
+  if (login.rucTabSelector) {
+    const rucTab = page.locator(login.rucTabSelector).first();
+    if (await rucTab.isVisible().catch(() => false)) {
+      await rucTab.click().catch(() => undefined);
+      await page.waitForTimeout(300);
+    }
+  }
+
+  if (login.rucSelector && credentials.ruc) {
+    await page.locator(login.rucSelector).first().fill(credentials.ruc);
+  }
+
+  if (await usernameField.isVisible().catch(() => false)) {
+    await usernameField.fill(credentials.username);
+  }
+
+  if (!(await passwordField.isVisible().catch(() => false))) {
+    const usernameSubmitSelector = login.usernameSubmitSelector ?? login.submitSelector;
+    await page.locator(usernameSubmitSelector).first().click();
+    await waitForLoginStep(page, login.passwordSelector, login.loggedInSelector);
+  }
+
+  if (await isLoggedIn(page, login.loggedInSelector)) {
+    return;
+  }
+
+  await passwordField.waitFor({ state: "visible", timeout: 15_000 });
+  await passwordField.fill(credentials.password);
+  const submitButton = page.locator(login.passwordSubmitSelector ?? login.submitSelector).first();
+  await submitButton.click();
+  await waitForLoginStep(page, undefined, login.loggedInSelector);
+  await page.waitForLoadState("networkidle").catch(() => undefined);
+}
+
+async function navigateSunatSolMenu(page: Page, labels: string[], onStep: StepReporter): Promise<void> {
+  for (const label of labels) {
+    await onStep(`Menú SUNAT: ${label}`);
+    const target = page.getByText(label, { exact: true }).first();
+    await target.waitFor({ state: "visible", timeout: 45_000 });
+    await target.scrollIntoViewIfNeeded();
+    await target.click();
+    await page.waitForTimeout(500);
+  }
+}
+
+async function waitForVisibleLocatorInPageTree(
+  page: Page,
+  selector: string,
+  timeoutMs: number,
+  preferredScope?: PageScope,
+): Promise<{ scope: PageScope; locator: Locator }> {
+  return waitForAnyVisibleLocatorInPageTree(page, [selector], timeoutMs, preferredScope);
+}
+
+async function waitForAnyVisibleLocatorInPageTree(
+  page: Page,
+  selectors: string[],
+  timeoutMs: number,
+  preferredScope?: PageScope,
+): Promise<{ scope: PageScope; locator: Locator }> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const scopes = preferredScope
+      ? [preferredScope, ...collectPageScopes(page).filter((scope) => scope !== preferredScope)]
+      : collectPageScopes(page);
+
+    for (const scope of scopes) {
+      for (const selector of selectors) {
+        const locator = scope.locator(selector);
+        const count = await locator.count().catch(() => 0);
+
+        if (!count) {
+          continue;
+        }
+
+        for (let index = 0; index < Math.min(count, 20); index += 1) {
+          const candidate = locator.nth(index);
+          if (await candidate.isVisible().catch(() => false)) {
+            return { scope, locator: candidate };
+          }
+        }
+      }
+    }
+
+    await page.waitForTimeout(250);
+  }
+
+  const visibleControlSummary = await describeVisibleControlsInPageTree(page);
+  throw new Error(
+    `No se encontró un elemento visible para ninguno de los selectores: ${selectors.join(" | ")}\nControles visibles detectados: ${visibleControlSummary}`,
+  );
+}
+
+async function waitForBottomMostVisibleLocatorInPageTree(
+  page: Page,
+  selectors: string[],
+  timeoutMs: number,
+  preferredScope?: PageScope,
+): Promise<{ scope: PageScope; locator: Locator }> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const scopes = preferredScope
+      ? [preferredScope, ...collectPageScopes(page).filter((scope) => scope !== preferredScope)]
+      : collectPageScopes(page);
+
+    let bestMatch: { scope: PageScope; locator: Locator; score: number } | null = null;
+
+    for (const scope of scopes) {
+      for (const selector of selectors) {
+        const locator = scope.locator(selector);
+        const count = await locator.count().catch(() => 0);
+
+        if (!count) {
+          continue;
+        }
+
+        for (let index = 0; index < Math.min(count, 20); index += 1) {
+          const candidate = locator.nth(index);
+          if (!(await candidate.isVisible().catch(() => false))) {
+            continue;
+          }
+
+          const box = await candidate.boundingBox().catch(() => null);
+          const score = (box?.y ?? 0) + (box?.height ?? 0);
+          if (!bestMatch || score > bestMatch.score) {
+            bestMatch = { scope, locator: candidate, score };
+          }
+        }
+      }
+    }
+
+    if (bestMatch) {
+      return { scope: bestMatch.scope, locator: bestMatch.locator };
+    }
+
+    await page.waitForTimeout(250);
+  }
+
+  return waitForAnyVisibleLocatorInPageTree(page, selectors, 1_000, preferredScope);
+}
+
+async function tryWaitForBottomMostVisibleLocatorInPageTree(
+  page: Page,
+  selectors: string[],
+  timeoutMs: number,
+  preferredScope?: PageScope,
+): Promise<{ scope: PageScope; locator: Locator } | null> {
+  try {
+    return await waitForBottomMostVisibleLocatorInPageTree(page, selectors, timeoutMs, preferredScope);
+  } catch {
+    return null;
+  }
+}
+
+async function tryWaitForVisibleLocatorInPageTree(
+  page: Page,
+  selector: string,
+  timeoutMs: number,
+  preferredScope?: PageScope,
+): Promise<{ scope: PageScope; locator: Locator } | null> {
+  try {
+    return await waitForVisibleLocatorInPageTree(page, selector, timeoutMs, preferredScope);
+  } catch {
+    return null;
+  }
+}
+
+async function tryWaitForAnyVisibleLocatorInPageTree(
+  page: Page,
+  selectors: string[],
+  timeoutMs: number,
+  preferredScope?: PageScope,
+): Promise<{ scope: PageScope; locator: Locator } | null> {
+  try {
+    return await waitForAnyVisibleLocatorInPageTree(page, selectors, timeoutMs, preferredScope);
+  } catch {
+    return null;
+  }
+}
+
+async function waitForAutofilledCustomerName(
+  page: Page,
+  selectors: string[],
+  expectedName: string,
+  preferredScope?: PageScope,
+  onStep?: StepReporter,
+): Promise<{ scope: PageScope; locator: Locator }> {
+  const field = await waitForAnyVisibleLocatorInPageTree(page, selectors, 30_000, preferredScope);
+  const deadline = Date.now() + 20_000;
+  const expected = normalizeComparableText(expectedName);
+  const fieldIdentity = await describeLocatorIdentity(field.locator);
+  let nextProgressLogAt = Date.now();
+
+  while (Date.now() < deadline) {
+    const value = await readLocatorValue(field.locator);
+    const normalizedValue = normalizeComparableText(value);
+
+    if (normalizedValue) {
+      await onStep?.(`Nombre del cliente listo en SUNAT (${fieldIdentity}): ${truncateForLog(value, 80)}`);
+      if (
+        !expected ||
+        normalizedValue.includes(expected) ||
+        expected.includes(normalizedValue)
+      ) {
+        return field;
+      }
+
+      // SUNAT puede autocompletar el nombre con un formato distinto al esperado;
+      // si el campo ya trae contenido, continuamos con el flujo.
+      return field;
+    }
+
+    if (Date.now() >= nextProgressLogAt) {
+      await onStep?.(`Esperando que SUNAT complete el nombre del cliente (${fieldIdentity}).`);
+      nextProgressLogAt = Date.now() + 3_000;
+    }
+
+    await page.waitForTimeout(250);
+  }
+
+  throw new Error(
+    `SUNAT no cargó el nombre del cliente para el documento ${expectedName || "sin nombre esperado"}.`,
+  );
+}
+
+function collectPageScopes(page: Page): PageScope[] {
+  return [page, ...page.frames()];
+}
+
+async function describeVisibleControlsInPageTree(page: Page): Promise<string> {
+  const summaries: string[] = [];
+
+  for (const scope of collectPageScopes(page)) {
+    const url = "url" in scope ? scope.url() : "";
+    const controls = await scope
+      .locator("input, select, textarea, button")
+      .evaluateAll((elements) =>
+        elements
+          .filter((element) => element instanceof HTMLElement)
+          .filter(
+            (element) =>
+              Boolean(
+                element.offsetWidth || element.offsetHeight || element.getClientRects().length,
+              ),
+          )
+          .slice(0, 12)
+          .map((element) => {
+            const htmlElement = element;
+            return {
+              tag: htmlElement.tagName.toLowerCase(),
+              id: htmlElement.id || "",
+              name: htmlElement.getAttribute("name") || "",
+              type: htmlElement.getAttribute("type") || "",
+              value: htmlElement.getAttribute("value") || "",
+              text: (htmlElement.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80),
+              title: htmlElement.getAttribute("title") || "",
+            };
+          }),
+      )
+      .catch(() => []);
+
+    if (controls.length) {
+      summaries.push(`${url || "about:blank"} => ${JSON.stringify(controls)}`);
+    }
+  }
+
+  return summaries.join(" || ") || "sin controles visibles";
+}
+
+async function readLocatorValue(locator: Locator): Promise<string> {
+  const inputValue = await locator.inputValue().catch(() => "");
+  if (inputValue.trim()) {
+    return inputValue.trim();
+  }
+
+  const attributeValue = await locator.getAttribute("value").catch(() => "");
+  if (attributeValue?.trim()) {
+    return attributeValue.trim();
+  }
+
+  const text = await locator.textContent().catch(() => "");
+  if (text?.trim()) {
+    return text.trim();
+  }
+
+  const innerText = await locator.evaluate((element) => (element as HTMLElement).innerText || "").catch(() => "");
+  return innerText.trim();
+}
+
+async function describeLocatorIdentity(locator: Locator): Promise<string> {
+  return locator
+    .evaluate((element) => {
+      const htmlElement = element as HTMLElement;
+      const tag = htmlElement.tagName.toLowerCase();
+      const id = htmlElement.id ? `#${htmlElement.id}` : "";
+      const name = htmlElement.getAttribute("name");
+      return `${tag}${id}${name ? `[name=${name}]` : ""}`;
+    })
+    .catch(() => "campo-desconocido");
+}
+
+function truncateForLog(value: string, maxLength: number): string {
+  if (value.length <= maxLength) {
+    return value;
+  }
+
+  return `${value.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+async function readSunatReceiptNumber(page: Page, profile: SiteProfile): Promise<string | undefined> {
+  const selector = profile.sunat.receiptNumberSelector;
+
+  if (selector) {
+    const locator = await tryWaitForVisibleLocatorInPageTree(page, selector, 5_000);
+    if (locator) {
+      const value = await readLocatorValue(locator.locator);
+      const match = value.match(/[A-Z]{1,4}\d{0,2}-\d+/i);
+      if (match) {
+        return match[0].toUpperCase();
+      }
+    }
+  }
+
+  const bodyText = (await page.locator("body").textContent().catch(() => "")) ?? "";
+  const match = bodyText.match(/[A-Z]{1,4}\d{0,2}-\d+/i);
+  return match?.[0]?.toUpperCase();
+}
+
+async function downloadSunatReceiptFiles(
+  page: Page,
+  profile: SiteProfile,
+  config: AppConfig,
+  orderNumber: string,
+  customerDocumentNumber: string,
+  receiptNumber?: string,
+): Promise<string[]> {
+  const downloadsDir = path.join(config.dataPaths.rootDir, "boletas-descargadas");
+  fs.mkdirSync(downloadsDir, { recursive: true });
+  const prefix = extractSunatReceiptPrefix(receiptNumber);
+  const baseName = `${orderNumber}_${prefix}-${customerDocumentNumber}`;
+  const downloadedFiles: string[] = [];
+
+  if (profile.sunat.pdfDownloadSelector) {
+    const pdfPath = await triggerSunatDownload(page, profile.sunat.pdfDownloadSelector, path.join(downloadsDir, `${baseName}.pdf`));
+    if (pdfPath) {
+      downloadedFiles.push(pdfPath);
+    }
+  }
+
+  if (profile.sunat.xmlDownloadSelector) {
+    const xmlPath = await triggerSunatDownload(page, profile.sunat.xmlDownloadSelector, path.join(downloadsDir, `${baseName}.xml`));
+    if (xmlPath) {
+      downloadedFiles.push(xmlPath);
+    }
+  }
+
+  return downloadedFiles;
+}
+
+function extractSunatReceiptPrefix(receiptNumber?: string): string {
+  const token = (receiptNumber || "").match(/[A-Z]{1,4}\d{0,2}/i)?.[0];
+  return (token || "EB01").toUpperCase();
+}
+
+async function triggerSunatDownload(
+  page: Page,
+  selector: string,
+  targetPath: string,
+): Promise<string | undefined> {
+  const button = await tryWaitForVisibleLocatorInPageTree(page, selector, 10_000);
+  if (!button) {
+    return undefined;
+  }
+
+  const download = await waitForSunatDownload(page, button.locator);
+  if (!download) {
+    return undefined;
+  }
+
+  await download.saveAs(targetPath);
+  return targetPath;
+}
+
+async function waitForSunatDownload(page: Page, locator: Locator): Promise<Download | undefined> {
+  try {
+    const [download] = await Promise.all([
+      page.waitForEvent("download", { timeout: 20_000 }),
+      locator.click(),
+    ]);
+    return download;
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeComparableText(value: string): string {
+  return value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+export function customerDocumentSelectors(primarySelector: string): string[] {
+  return uniqueSelectors([
+    primarySelector,
+    "#boleta\\.numeroDocumento",
+    "xpath=//*[@id='boleta.numeroDocumento']",
+    "xpath=//*[@id='inicio.numeroDocumento']",
+    "xpath=//td[contains(normalize-space(.), 'Consigne el Número del Documento del Cliente')]/following-sibling::td//input[not(@type='hidden')][1]",
+    "xpath=//td[contains(normalize-space(.), 'Consigne el Numero del Documento del Cliente')]/following-sibling::td//input[not(@type='hidden')][1]",
+    "xpath=//td[contains(normalize-space(.), 'Número de documento')]/following-sibling::td//input[1]",
+    "xpath=//td[contains(normalize-space(.), 'Numero de documento')]/following-sibling::td//input[1]",
+    "xpath=//label[contains(normalize-space(.), 'Número de documento')]/following::input[1]",
+    "xpath=//label[contains(normalize-space(.), 'Numero de documento')]/following::input[1]",
+    "xpath=//*[contains(normalize-space(.), 'Número del Documento del Cliente')]/following::input[1]",
+    "xpath=//*[contains(normalize-space(.), 'Numero del Documento del Cliente')]/following::input[1]",
+  ]);
+}
+
+export function customerNameSelectors(primarySelector: string): string[] {
+  return uniqueSelectors([
+    primarySelector,
+    "#boleta\\.razonSocial",
+    "xpath=//*[@id='boleta.razonSocial']",
+    "xpath=//*[@id='inicio.razonSocial']",
+    "xpath=//td[contains(normalize-space(.), 'Consigne Apellidos y Nombres del Cliente')]/following-sibling::td//input[not(@type='hidden')][1]",
+    "xpath=//td[contains(normalize-space(.), 'Consigne Apellidos y Nombres del Cliente, o Denominación o Razón Social')]/following-sibling::td//input[not(@type='hidden')][1]",
+    "xpath=//td[contains(normalize-space(.), 'Consigne Apellidos y Nombres del Cliente, o Denominacion o Razon Social')]/following-sibling::td//input[not(@type='hidden')][1]",
+    "xpath=//td[contains(normalize-space(.), 'Nombre del Cliente')]/following-sibling::td//input[1]",
+    "xpath=//label[contains(normalize-space(.), 'Nombre del Cliente')]/following::input[1]",
+    "xpath=//*[contains(normalize-space(.), 'Nombre del Cliente')]/following::input[1]",
+  ]);
+}
+
+function customerDocumentTypeSelectors(primarySelector: string): string[] {
+  return uniqueSelectors([
+    primarySelector,
+    "xpath=//*[@id='inicio.tipoDocumento']",
+    "xpath=//td[contains(normalize-space(.), 'Seleccione el Tipo de documento y número de documento del Cliente')]/following-sibling::td//select[1]",
+    "xpath=//td[contains(normalize-space(.), 'Seleccione el Tipo de documento y numero de documento del Cliente')]/following-sibling::td//select[1]",
+  ]);
+}
+
+export function customerContinueSelectors(primarySelector: string): string[] {
+  return uniqueSelectors([
+    primarySelector,
+    "#boleta\\.botonGrabarDocumento_label",
+    "xpath=//*[@id='boleta.botonGrabarDocumento_label']",
+    "xpath=//*[@id='boleta.botonGrabarDocumento_label']/ancestor::*[@id='boleta.botonGrabarDocumento'][1]",
+    "#boleta\\.botonGrabarDocumento",
+    "xpath=//*[@id='boleta.botonGrabarDocumento']",
+    "text=Continuar",
+    "xpath=//*[contains(concat(' ', normalize-space(@class), ' '), ' dijitButtonText ') and contains(normalize-space(.), 'Continuar')]",
+    "xpath=//*[@role='button' and contains(normalize-space(.), 'Continuar')]",
+    "#inicio\\.botonGrabarDocumento",
+    "xpath=//*[@id='inicio.botonGrabarDocumento']",
+    "xpath=//input[@type='button' and contains(@value, 'Continuar')]",
+    "xpath=//input[contains(@value, 'Continuar')]",
+    "xpath=//button[contains(normalize-space(.), 'Continuar')]",
+    "xpath=//input[@type='submit' and contains(@value, 'Continuar')]",
+  ]);
+}
+
+async function continueSunatBoletaWizard(
+  page: Page,
+  profile: SiteProfile,
+  onStep?: StepReporter,
+): Promise<void> {
+  if (profile.sunat.finalSubmitSelector) {
+    const submitReady = await tryWaitForVisibleLocatorInPageTree(
+      page,
+      profile.sunat.finalSubmitSelector,
+      2_000,
+    );
+    if (submitReady) {
+      await onStep?.("SUNAT ya está en la etapa final de envío.");
+      return;
+    }
+  }
+
+  const preliminaryMarker = await tryWaitForAnyVisibleLocatorInPageTree(
+    page,
+    preliminarySunatStepMarkers(),
+    2_000,
+  );
+  if (preliminaryMarker) {
+    await onStep?.("SUNAT ya mostró la preliminar de la boleta.");
+    return;
+  }
+
+  await onStep?.("Buscando el botón Continuar de la boleta.");
+  const continueSelectors = customerContinueSelectors(profile.sunat.customerContinueSelector ?? "text=Continuar");
+  const firstContinue = await tryWaitForBottomMostVisibleLocatorInPageTree(page, continueSelectors, 30_000);
+  if (!firstContinue) {
+    await onStep?.("No encontré Continuar; esperaré si SUNAT cambia de pantalla por su cuenta.");
+    await waitForAnyVisibleLocatorInPageTree(
+      page,
+      [...preliminarySunatStepMarkers(), profile.sunat.finalSubmitSelector ?? ""].filter(Boolean),
+      30_000,
+    );
+    return;
+  }
+  await onStep?.("Encontré Continuar y voy a hacer click.");
+  await firstContinue.locator.scrollIntoViewIfNeeded().catch(() => undefined);
+  await firstContinue.locator.click();
+  await page.waitForTimeout(1_000);
+
+  const optionalMarker = await tryWaitForAnyVisibleLocatorInPageTree(
+    page,
+    optionalSunatStepMarkers(),
+    8_000,
+  );
+
+  if (!optionalMarker) {
+    return;
+  }
+
+  const secondContinue = await waitForBottomMostVisibleLocatorInPageTree(page, continueSelectors, 15_000);
+  await onStep?.("SUNAT mostró una pantalla opcional; hago click en Continuar otra vez.");
+  await secondContinue.locator.scrollIntoViewIfNeeded().catch(() => undefined);
+  await secondContinue.locator.click();
+  await page.waitForTimeout(1_000);
+
+  await waitForAnyVisibleLocatorInPageTree(
+    page,
+    [...preliminarySunatStepMarkers(), profile.sunat.finalSubmitSelector ?? ""].filter(Boolean),
+    30_000,
+  );
+}
+
+function optionalSunatStepMarkers(): string[] {
+  return uniqueSelectors([
+    "text=Esta pantalla es opcional",
+    "text=Consigne las observaciones de la Boleta de Venta",
+    "text=Consigne Información Relacionada a la Boleta de Venta",
+    "text=Informacion Relacionada",
+  ]);
+}
+
+function preliminarySunatStepMarkers(): string[] {
+  return uniqueSelectors([
+    "text=PRELIMINAR DE BOLETA DE VENTA ELECTRÓNICA",
+    "text=PRELIMINAR DE BOLETA DE VENTA ELECTRONICA",
+    "text=Señor(es)",
+  ]);
+}
+
+async function addItemsViaSunatModal(
+  page: Page,
+  preferredScope: PageScope,
+  draft: InvoiceDraft,
+  profile: SiteProfile,
+  onStep: StepReporter,
+): Promise<void> {
+  const itemDialogSelector = profile.sunat.itemDialogSelector;
+  const itemAcceptSelector = profile.sunat.itemAcceptSelector;
+
+  if (!itemDialogSelector || !itemAcceptSelector) {
+    throw new Error("Faltan selectores del modal de ítems para SUNAT.");
+  }
+
+  const existingRowCount = await countVisibleItemRows(preferredScope, profile.sunat.itemRowSelector);
+
+  for (let index = 0; index < draft.items.length; index += 1) {
+    const item = draft.items[index];
+    const sanitizedDescription = sanitizeSunatItemDescription(item.description);
+    await onStep(`Agregando item ${index + 1} de ${draft.items.length} en SUNAT`);
+
+    const addButton = await waitForAnyVisibleLocatorInPageTree(
+      page,
+      addItemButtonSelectors(profile.sunat.addItemButtonSelector),
+      30_000,
+      preferredScope,
+    );
+    await addButton.locator.click();
+
+    const dialog = await waitForAnyVisibleLocatorInPageTree(
+      page,
+      itemDialogSelectors(itemDialogSelector),
+      30_000,
+      addButton.scope,
+    );
+
+    await selectSunatItemKindAsGood(page, dialog.scope);
+
+    const quantityField = await waitForAnyVisibleLocatorInPageTree(
+      page,
+      itemQuantitySelectors(profile.sunat.itemQuantitySelector),
+      30_000,
+      dialog.scope,
+    );
+    await quantityField.locator.fill(String(item.quantity));
+
+    if (profile.sunat.itemUnitMeasureSelector) {
+      const unitMeasureField = await tryWaitForAnyVisibleLocatorInPageTree(
+        page,
+        itemUnitMeasureSelectors(profile.sunat.itemUnitMeasureSelector),
+        5_000,
+        dialog.scope,
+      );
+      if (unitMeasureField) {
+        await setSunatUnitMeasure(unitMeasureField.locator, item.description);
+      }
+    }
+
+    const descriptionField = await waitForAnyVisibleLocatorInPageTree(
+      page,
+      itemDescriptionSelectors(profile.sunat.itemDescriptionSelector),
+      30_000,
+      dialog.scope,
+    );
+    await descriptionField.locator.fill(sanitizedDescription);
+
+    await selectSunatTaxCategory(page, dialog.scope, profile, draft);
+
+    const unitPriceValue = formatSunatCurrency(calculateSunatUnitPrice(item, draft));
+    const unitPriceField = await waitForAnyVisibleLocatorInPageTree(
+      page,
+      itemUnitPriceSelectors(profile.sunat.itemUnitPriceSelector),
+      30_000,
+      dialog.scope,
+    );
+    await typeIntoSunatCurrencyField(page, unitPriceField.locator, unitPriceValue);
+    await triggerSunatItemAmountUpdate(page);
+    await waitForSunatItemAmountPreview(page, dialog.scope);
+
+    const acceptButton = await waitForAnyVisibleLocatorInPageTree(
+      page,
+      itemAcceptSelectors(itemAcceptSelector),
+      30_000,
+      dialog.scope,
+    );
+    await acceptButton.locator.click();
+    await onStep(`SUNAT aceptó el item ${index + 1} y espero que se cierre el modal.`);
+
+    await waitForSunatItemAcceptance(
+      page,
+      preferredScope,
+      itemDialogSelectors(itemDialogSelector),
+      profile.sunat.itemRowSelector,
+      existingRowCount + index + 1,
+      30_000,
+      dialog.scope,
+    );
+    await onStep(`El modal del item ${index + 1} ya se cerró en SUNAT.`);
+
+    if (profile.sunat.itemRowSelector) {
+      await waitForMinimumItemRows(
+        preferredScope,
+        profile.sunat.itemRowSelector,
+        existingRowCount + index + 1,
+        1_500,
+      )
+        .then(() => onStep(`El item ${index + 1} ya aparece en la grilla principal de SUNAT.`))
+        .catch(() => onStep(`No pude confirmar por conteo la grilla del item ${index + 1}; igual continuaré.`));
+    }
+  }
+}
+
+export function addItemButtonSelectors(primarySelector?: string): string[] {
+  return uniqueSelectors([
+    primarySelector ?? "",
+    "span.dijitReset.dijitInline.dijitButtonText:has-text(\"Adicionar\")",
+    "xpath=//*[contains(concat(' ', normalize-space(@class), ' '), ' dijitButtonText ') and contains(normalize-space(.), 'Adicionar')]/ancestor::*[self::a or self::button or @role='button'][1]",
+    "xpath=//*[contains(concat(' ', normalize-space(@class), ' '), ' dijitButtonText ') and contains(normalize-space(.), 'Adicionar')]",
+    "text=Adicionar",
+    "xpath=//a[contains(normalize-space(.), 'Adicionar')]",
+    "xpath=//input[contains(@value, 'Adicionar')]",
+    "xpath=//button[contains(normalize-space(.), 'Adicionar')]",
+  ]);
+}
+
+function itemDialogSelectors(primarySelector: string): string[] {
+  return uniqueSelectors([
+    primarySelector,
+    "#dialogItem",
+    "text=Nuevo Item",
+    "xpath=//*[@id='dialogItem']",
+    "xpath=//*[contains(normalize-space(.), 'Nuevo Item')]",
+  ]);
+}
+
+function itemAcceptSelectors(primarySelector: string): string[] {
+  return uniqueSelectors([
+    primarySelector,
+    "#item\\.botonAceptar",
+    "text=Aceptar",
+    "xpath=//*[@id='item.botonAceptar']",
+    "xpath=//input[contains(@value, 'Aceptar')]",
+    "xpath=//button[contains(normalize-space(.), 'Aceptar')]",
+  ]);
+}
+
+function itemQuantitySelectors(primarySelector: string): string[] {
+  return uniqueSelectors([
+    primarySelector,
+    "#item\\.cantidad",
+    "xpath=//*[@id='item.cantidad']",
+    "xpath=//*[contains(normalize-space(.), 'Cantidad')]/following::input[not(@type='hidden') and not(@readonly) and not(@aria-hidden='true')][1]",
+  ]);
+}
+
+function itemDescriptionSelectors(primarySelector: string): string[] {
+  return uniqueSelectors([
+    primarySelector,
+    "#item\\.descripcion",
+    "xpath=//*[@id='item.descripcion']",
+    "xpath=//*[contains(normalize-space(.), 'Descripción') or contains(normalize-space(.), 'Descripcion')]/following::textarea[1]",
+  ]);
+}
+
+function itemUnitPriceSelectors(primarySelector: string): string[] {
+  return uniqueSelectors([
+    primarySelector,
+    "#item\\.precioUnitario",
+    "xpath=//*[@id='item.precioUnitario']",
+    "xpath=//*[@id='item.valorUnitario']",
+    "xpath=//*[contains(normalize-space(.), 'Valor Unitario')]/following::input[not(@type='hidden') and not(@readonly) and not(@aria-hidden='true')][1]",
+  ]);
+}
+
+function itemCodeSelectors(primarySelector: string): string[] {
+  return uniqueSelectors([
+    primarySelector,
+    "#item\\.codigoItem",
+    "xpath=//*[@id='item.codigoItem']",
+    "xpath=//*[contains(normalize-space(.), 'Código') or contains(normalize-space(.), 'Codigo')]/following::input[not(@type='hidden') and not(@readonly) and not(@aria-hidden='true')][1]",
+  ]);
+}
+
+function itemUnitMeasureSelectors(primarySelector: string): string[] {
+  return uniqueSelectors([
+    primarySelector,
+    "#item\\.unidadMedida",
+    "xpath=//*[@id='item.unidadMedida']",
+    "xpath=//*[contains(normalize-space(.), 'Unidad de Medida')]/following::select[1]",
+    "xpath=//*[contains(normalize-space(.), 'Unidad de Medida')]/following::input[@type='text'][1]",
+  ]);
+}
+
+async function selectSunatTaxCategory(
+  page: Page,
+  preferredScope: PageScope,
+  profile: SiteProfile,
+  draft: InvoiceDraft,
+): Promise<void> {
+  const targetSelectors =
+    draft.totals.tax > 0
+      ? itemTaxedSelectors(profile.sunat.itemTaxedSelector)
+      : itemExemptSelectors(profile.sunat.itemExemptSelector, profile.sunat.itemUnaffectedSelector);
+
+  const radio = await tryWaitForAnyVisibleLocatorInPageTree(
+    page,
+    targetSelectors,
+    5_000,
+    preferredScope,
+  );
+
+  if (radio) {
+    await radio.locator.check().catch(() => radio.locator.click().catch(() => undefined));
+  }
+}
+
+function itemTaxedSelectors(primarySelector?: string): string[] {
+  return uniqueSelectors([
+    primarySelector ?? "",
+    "#item\\.subTipoTB00",
+    "xpath=//*[@id='item.subTipoTB00']",
+    "xpath=//input[@type='radio' and @value='gra']",
+    "xpath=//*[contains(normalize-space(.), 'Gravado')]/preceding::input[@type='radio'][1]",
+  ]);
+}
+
+function itemExemptSelectors(primarySelector?: string, unaffectedSelector?: string): string[] {
+  return uniqueSelectors([
+    primarySelector ?? "",
+    unaffectedSelector ?? "",
+    "#item\\.subTipoTB01",
+    "xpath=//*[@id='item.subTipoTB01']",
+    "#item\\.subTipoTB02",
+    "xpath=//*[@id='item.subTipoTB02']",
+    "xpath=//*[contains(normalize-space(.), 'Exonerado')]/preceding::input[@type='radio'][1]",
+    "xpath=//*[contains(normalize-space(.), 'Inafecto')]/preceding::input[@type='radio'][1]",
+  ]);
+}
+
+async function waitForItemDialogToClose(
+  page: Page,
+  selectors: string[],
+  timeoutMs: number,
+  preferredScope?: PageScope,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const dialog = await tryWaitForAnyVisibleLocatorInPageTree(page, selectors, 500, preferredScope);
+    if (!dialog) {
+      return;
+    }
+    await page.waitForTimeout(250);
+  }
+
+  throw new Error("El modal de SUNAT para agregar ítems no se cerró después de aceptar.");
+}
+
+async function waitForSunatItemAcceptance(
+  page: Page,
+  gridScope: PageScope,
+  dialogSelectors: string[],
+  rowSelector: string | undefined,
+  minimumRowCount: number,
+  timeoutMs: number,
+  dialogScope?: PageScope,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    if (rowSelector) {
+      const visibleRows = await countVisibleItemRows(gridScope, rowSelector).catch(() => 0);
+      if (visibleRows >= minimumRowCount) {
+        return;
+      }
+    }
+
+    const dialog = await tryWaitForAnyVisibleLocatorInPageTree(page, dialogSelectors, 500, dialogScope);
+    if (!dialog) {
+      return;
+    }
+    await page.waitForTimeout(250);
+  }
+
+  await waitForItemDialogToClose(page, dialogSelectors, 1_000, dialogScope);
+
+  if (rowSelector) {
+    await waitForMinimumItemRows(gridScope, rowSelector, minimumRowCount);
+    return;
+  }
+
+  throw new Error("El modal de SUNAT para agregar ítems no se cerró después de aceptar.");
+}
+
+async function countVisibleItemRows(scope: PageScope, rowSelector: string): Promise<number> {
+  const rows = scope.locator(rowSelector);
+  const count = await rows.count().catch(() => 0);
+  let visibleCount = 0;
+
+  for (let index = 0; index < count; index += 1) {
+    if (await rows.nth(index).isVisible().catch(() => false)) {
+      visibleCount += 1;
+    }
+  }
+
+  return visibleCount;
+}
+
+async function waitForMinimumItemRows(
+  scope: PageScope,
+  rowSelector: string,
+  minimumCount: number,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    if ((await countVisibleItemRows(scope, rowSelector)) >= minimumCount) {
+      return;
+    }
+    if ("page" in scope) {
+      await scope.page().waitForTimeout(250).catch(() => undefined);
+    } else {
+      await scope.waitForTimeout(250).catch(() => undefined);
+    }
+  }
+
+  throw new Error("SUNAT no reflejó el ítem agregado en la grilla principal a tiempo.");
+}
+
+async function selectSunatItemKindAsGood(page: Page, preferredScope: PageScope): Promise<void> {
+  const goodRadio = await tryWaitForAnyVisibleLocatorInPageTree(
+    page,
+    itemGoodSelectors(),
+    5_000,
+    preferredScope,
+  );
+
+  if (!goodRadio) {
+    return;
+  }
+
+  await goodRadio.locator.check().catch(() => goodRadio.locator.click().catch(() => undefined));
+}
+
+function itemGoodSelectors(): string[] {
+  return uniqueSelectors([
+    "#item\\.subTipoTI01",
+    "xpath=//*[@id='item.subTipoTI01']",
+    "xpath=//input[@type='radio' and contains(@id, 'Bien')]",
+    "xpath=//*[contains(normalize-space(.), 'Bien')]/preceding::input[@type='radio'][1]",
+  ]);
+}
+
+async function setSunatUnitMeasure(locator: Locator, description: string): Promise<void> {
+  const targetLabel = "UNIDAD";
+
+  const selected = await locator.evaluate((element, target) => {
+    if (element instanceof HTMLSelectElement) {
+      const option = Array.from(element.options).find((candidate) =>
+        (candidate.label || candidate.textContent || "").includes(target),
+      );
+      return option?.value || "";
+    }
+
+    if (element instanceof HTMLInputElement) {
+      return element.value.includes(target) ? "__already_selected__" : "";
+    }
+
+    return "";
+  }, targetLabel);
+
+  if (selected === "__already_selected__") {
+    return;
+  }
+
+  if (selected) {
+    await locator.selectOption(selected).catch(() => undefined);
+  }
+}
+
+async function setSunatDojoWidgetValue(
+  page: Page,
+  widgetId: string,
+  rawValue: number | string,
+  displayedValue = String(rawValue),
+): Promise<void> {
+  await page.evaluate(
+    ({ widgetId, rawValue, displayedValue }) => {
+      const globalWindow = window as typeof window & {
+        dijit?: {
+          byId?: (id: string) => {
+            set?: (prop: string, newValue: unknown) => void;
+            domNode?: Element | null;
+            textbox?: HTMLInputElement | HTMLTextAreaElement | null;
+            focusNode?: HTMLInputElement | HTMLTextAreaElement | null;
+          } | null;
+        };
+      };
+      const widget = globalWindow.dijit?.byId?.(widgetId) ?? null;
+      const numericValue =
+        typeof rawValue === "number" ? rawValue : Number.isFinite(Number(rawValue)) ? Number(rawValue) : null;
+
+      if (widget?.set) {
+        widget.set("value", numericValue ?? rawValue);
+        widget.set("displayedValue", displayedValue);
+      }
+
+      const widgetNode =
+        widget?.domNode instanceof Element
+          ? widget.domNode.querySelector("input:not([type='hidden']), textarea, select")
+          : null;
+      const element = widget?.focusNode || widget?.textbox || widgetNode || document.getElementById(widgetId);
+
+      if (
+        element instanceof HTMLInputElement ||
+        element instanceof HTMLTextAreaElement ||
+        element instanceof HTMLSelectElement
+      ) {
+        element.value = displayedValue;
+        element.dispatchEvent(new Event("input", { bubbles: true }));
+        element.dispatchEvent(new Event("change", { bubbles: true }));
+        element.dispatchEvent(new Event("blur", { bubbles: true }));
+      }
+    },
+    { widgetId, rawValue, displayedValue },
+  );
+}
+
+async function typeIntoSunatCurrencyField(page: Page, locator: Locator, value: string): Promise<void> {
+  await locator.click();
+  await locator.evaluate((element) => {
+    if (element instanceof HTMLInputElement) {
+      element.focus();
+      element.setSelectionRange(0, element.value.length);
+    }
+  });
+  await page.keyboard.press("Meta+A").catch(() => undefined);
+  await page.keyboard.press("Backspace").catch(() => undefined);
+  await locator.pressSequentially(value, { delay: 80 });
+  await locator.blur();
+}
+
+async function triggerSunatItemAmountUpdate(page: Page): Promise<void> {
+  await page
+    .evaluate(() => {
+      const globalWindow = window as typeof window & {
+        boleta?: {
+          updateItemAmount?: () => void;
+        };
+      };
+      globalWindow.boleta?.updateItemAmount?.();
+    })
+    .catch(() => undefined);
+}
+
+async function waitForSunatItemAmountPreview(
+  page: Page,
+  preferredScope: PageScope,
+  timeoutMs = 5_000,
+): Promise<void> {
+  const previewSelectors = ["#item\\.precioConIGV", "#item\\.importeVenta"];
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const previewValues = await Promise.all(
+      previewSelectors.map(async (selector) => {
+        const field = await tryWaitForAnyVisibleLocatorInPageTree(page, [selector], 250, preferredScope);
+        return field ? readLocatorValue(field.locator) : "";
+      }),
+    );
+
+    if (previewValues.some((value) => value && !/undefined/i.test(value))) {
+      return;
+    }
+
+    await triggerSunatItemAmountUpdate(page);
+    await page.waitForTimeout(250);
+  }
+}
+
+function buildSunatItemCode(description: string, index: number): string {
+  const normalized = description
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z0-9]+/g, "")
+    .slice(0, 18)
+    .toUpperCase();
+
+  return normalized ? `${normalized}${index + 1}` : `ITEM${index + 1}`;
+}
+
+function formatSunatCurrency(value: number): string {
+  return value.toFixed(2);
+}
+
+function sanitizeSunatItemDescription(description: string): string {
+  const sanitized = description
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[,"'`-]/g, " ")
+    .replace(/[^a-zA-Z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return sanitized.slice(0, 60).trim();
+}
+
+function calculateSunatUnitPrice(item: InvoiceDraft["items"][number], draft: InvoiceDraft): number {
+  const quantity = Math.max(item.quantity, 1);
+  const grossUnitPrice = item.total > 0 ? item.total / quantity : item.unitPrice;
+
+  if (draft.totals.tax <= 0) {
+    return roundCurrency(grossUnitPrice);
+  }
+
+  return roundCurrency(grossUnitPrice / 1.18);
+}
+
+async function ensureCustomerDocumentType(locator: Locator, documentNumber: string): Promise<void> {
+  const targetOptionLabel = inferSunatDocumentTypeLabel(documentNumber);
+
+  if (!targetOptionLabel) {
+    return;
+  }
+
+  const matchesExistingValue = await locator.evaluate((element, target) => {
+    if (!(element instanceof HTMLInputElement)) {
+      return false;
+    }
+
+    const normalizedTarget = target
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+    const normalizedValue = (element.value || "")
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+
+    return normalizedValue.includes(normalizedTarget) || normalizedValue.includes("identidad");
+  }, targetOptionLabel);
+
+  if (matchesExistingValue) {
+    return;
+  }
+
+  const optionValue = await locator.evaluate((select, target) => {
+    if (!(select instanceof HTMLSelectElement)) {
+      return "";
+    }
+
+    const normalizedTarget = target
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+    const normalizedShortTarget = normalizedTarget.includes("identidad") ? "ident" : normalizedTarget;
+
+    for (const option of Array.from(select.options)) {
+      const normalizedLabel = (option.label || option.textContent || "")
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+
+      if (
+        normalizedLabel.includes(normalizedTarget) ||
+        normalizedLabel.includes(normalizedShortTarget)
+      ) {
+        return option.value;
+      }
+    }
+
+    return "";
+  }, targetOptionLabel);
+
+  if (!optionValue) {
+    return;
+  }
+
+  await locator.selectOption(optionValue).catch(() => undefined);
+}
+
+function inferSunatDocumentTypeLabel(documentNumber: string): string | undefined {
+  const sanitizedNumber = documentNumber.replace(/\D+/g, "");
+
+  if (sanitizedNumber.length === 8) {
+    return "documento nacional de identidad";
+  }
+
+  if (sanitizedNumber.length === 11) {
+    return "registro unico de contribuyentes";
+  }
+
+  return undefined;
+}
+
+function uniqueSelectors(selectors: string[]): string[] {
+  return [...new Set(selectors.filter(Boolean))];
+}
+
+async function ensureRowCount(
+  scope: PageScope,
+  rowSelector: string,
+  targetCount: number,
+  addItemButtonSelector?: string,
+): Promise<void> {
+  let count = await scope.locator(rowSelector).count();
+
+  while (count < targetCount) {
+    if (!addItemButtonSelector) {
+      throw new Error(
+        "No hay suficientes filas de ítems disponibles y no se configuró un selector para agregar filas.",
+      );
+    }
+
+    await scope.locator(addItemButtonSelector).first().click();
+    count = await scope.locator(rowSelector).count();
+  }
+}
+
+async function stopTraceSafely(
+  context: BrowserContext,
+  tracePath: string,
+  artifacts: Artifact[],
+): Promise<void> {
+  try {
+    await context.tracing.stop({ path: tracePath });
+    if (fs.existsSync(tracePath)) {
+      artifacts.push({ kind: "trace", path: tracePath });
+    }
+  } catch {
+    return;
+  }
+}
+
+function asErrorMessage(error: unknown): string {
+  if (error instanceof AutomationError) {
+    return error.message;
+  }
+
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return "Error desconocido en la automatización.";
+}
+
+function normalizeAutomationError(error: unknown, artifacts: Artifact[] = []): AutomationError {
+  if (error instanceof OperatorCancelledError) {
+    return error;
+  }
+
+  if (isBrowserClosedError(error)) {
+    return new OperatorCancelledError(undefined, artifacts);
+  }
+
+  if (error instanceof AutomationError) {
+    return error;
+  }
+
+  return new AutomationError(asErrorMessage(error), artifacts);
+}
+
+function isBrowserClosedError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+
+  return /Target page, context or browser has been closed|browser has been closed|page has been closed|context closed|Connection closed/i.test(
+    message,
+  );
+}
+
+async function isLoggedIn(page: Page, loggedInSelector?: string): Promise<boolean> {
+  if (!loggedInSelector) {
+    return false;
+  }
+
+  return page
+    .locator(loggedInSelector)
+    .first()
+    .isVisible()
+    .catch(() => false);
+}
+
+async function waitForLoginStep(
+  page: Page,
+  nextVisibleSelector?: string,
+  loggedInSelector?: string,
+): Promise<void> {
+  const waiters: Array<Promise<unknown>> = [
+    page.waitForLoadState("domcontentloaded").catch(() => undefined),
+  ];
+
+  if (nextVisibleSelector) {
+    waiters.push(
+      page
+        .locator(nextVisibleSelector)
+        .first()
+        .waitFor({ state: "visible", timeout: 15_000 })
+        .catch(() => undefined),
+    );
+  }
+
+  if (loggedInSelector) {
+    waiters.push(
+      page
+        .locator(loggedInSelector)
+        .first()
+        .waitFor({ state: "visible", timeout: 60_000 })
+        .catch(() => undefined),
+    );
+  }
+
+  await Promise.race(waiters);
+}

@@ -1,0 +1,391 @@
+import { useEffect, useMemo, useState } from "react";
+import { CircleAlert } from "lucide-react";
+import type { DashboardSnapshot } from "@shared/dashboard-contract";
+import { WorkflowHeader } from "./components/workflow/workflow-header";
+import { WorkflowStepper } from "./components/workflow/workflow-stepper";
+import { StepDetails } from "./components/workflow/step-details";
+import { AutomationHistorySidebar } from "./components/automation-history-sidebar";
+import { Card, CardContent } from "./components/ui/card";
+import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "./components/ui/empty";
+import { useDashboardSelection } from "./hooks/use-dashboard-selection";
+import {
+  buildDashboardApiUrl,
+  getDashboardApiBaseCandidates,
+  useDashboardState,
+} from "./hooks/use-dashboard-state";
+import {
+  buildWorkflowHeader,
+  buildWorkflowSteps,
+  resolveWorkflowActiveStepId,
+} from "./lib/workflow-view-model";
+import { findActiveRun, findRun } from "./lib/dashboard";
+
+const STEP_TWO_STAGE_ID = "registrar_facturas_sunat";
+
+async function requestAction(
+  url: string,
+  options?: {
+    method?: "POST" | "DELETE";
+    preferredBaseUrl?: string;
+  },
+) {
+  const method = options?.method ?? "POST";
+  let lastError: unknown;
+
+  for (const baseUrl of getDashboardApiBaseCandidates(options?.preferredBaseUrl)) {
+    try {
+      const response = await fetch(buildDashboardApiUrl(baseUrl, url), {
+        method,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
+
+      const payload = (await response.json()) as { message?: string };
+
+      if (!response.ok) {
+        throw new Error(payload.message || "La accion fallo.");
+      }
+
+      return payload.message || "Accion completada.";
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("La accion fallo.");
+}
+
+type DashboardWorkspaceProps = {
+  snapshot: DashboardSnapshot | null;
+  streamState: "loading" | "connected" | "reconnecting" | "error";
+  error: string | null;
+  flashMessage: string | null;
+  selectedRunId?: string | null;
+  selectedStageId?: string | null;
+  onStartRun: () => void;
+  onStopRun: () => void;
+  onStartStepTwo: () => void;
+  onSelectRun: (runId: string) => void;
+  onDeleteRun: (runId: string) => void;
+  onCloseRun: () => void;
+  onSelectStage: (stageId: string) => void;
+  onApprove: (attemptId: string) => void;
+  onCancel: (attemptId: string) => void;
+  onRetry: (attemptId: string) => void;
+  pendingAction?: "run-all" | "step-2" | "stop" | null;
+  deletingRunId?: string | null;
+};
+
+function StatusMessage({ text }: { text: string }) {
+  return (
+    <div className="mb-6 rounded-xl border border-destructive/20 bg-destructive/5 px-4 py-3 text-sm text-destructive">
+      <div className="flex items-center gap-2">
+        <CircleAlert className="size-4" />
+        <span>{text}</span>
+      </div>
+    </div>
+  );
+}
+
+function resolveFocusedRun(snapshot: DashboardSnapshot, selectedRunId?: string | null) {
+  const selectedRun = findRun(snapshot, selectedRunId);
+  const activeRun = findActiveRun(snapshot);
+  const latestRun = snapshot.runs[0] ?? null;
+
+  return selectedRun ?? activeRun ?? latestRun;
+}
+
+export function DashboardWorkspace({
+  snapshot,
+  streamState: _streamState,
+  error,
+  flashMessage,
+  selectedRunId,
+  selectedStageId,
+  onStartRun,
+  onStopRun,
+  onStartStepTwo,
+  onSelectRun,
+  onDeleteRun,
+  onSelectStage,
+  pendingAction = null,
+  deletingRunId = null,
+}: DashboardWorkspaceProps) {
+  const [activeStepId, setActiveStepId] = useState<string>("");
+  const emptyHeader = {
+    workflowName: "Seller a SUNAT",
+    status: "idle" as const,
+    branch: "Listo para iniciar",
+    totalDuration: "-",
+    completedSteps: 0,
+    totalSteps: 2,
+  };
+
+  const focusedRun = snapshot ? resolveFocusedRun(snapshot, selectedRunId) : null;
+  const workflowSteps = snapshot && focusedRun ? buildWorkflowSteps(focusedRun, snapshot) : [];
+  const resolvedStepId =
+    snapshot && focusedRun ? resolveWorkflowActiveStepId(focusedRun, snapshot, selectedStageId) : undefined;
+  const activeStep = workflowSteps.find((step) => step.id === activeStepId) ?? workflowSteps.find((step) => step.id === resolvedStepId) ?? workflowSteps[0];
+  const activeStepNumber = activeStep ? workflowSteps.findIndex((step) => step.id === activeStep.id) + 1 : 0;
+
+  useEffect(() => {
+    if (!resolvedStepId && workflowSteps[0]?.id) {
+      setActiveStepId(workflowSteps[0].id);
+      return;
+    }
+
+    if (resolvedStepId) {
+      setActiveStepId(resolvedStepId);
+    }
+  }, [resolvedStepId, workflowSteps]);
+
+  if (!snapshot || !focusedRun) {
+    if (snapshot) {
+      return (
+        <div className="min-h-screen bg-background">
+          <WorkflowHeader
+            workflowName={emptyHeader.workflowName}
+            status={emptyHeader.status}
+            branch={emptyHeader.branch}
+            totalDuration={emptyHeader.totalDuration}
+            completedSteps={emptyHeader.completedSteps}
+            totalSteps={emptyHeader.totalSteps}
+            onStartRun={onStartRun}
+            onStopRun={onStopRun}
+            isRunning={snapshot.runtime.isRunning}
+            isStopping={pendingAction === "stop"}
+          />
+
+          <main className="container mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:py-8">
+            {error ? <StatusMessage text={error} /> : null}
+            {flashMessage ? <StatusMessage text={flashMessage} /> : null}
+
+            <div className="grid gap-6 lg:grid-cols-[22rem_minmax(0,1fr)] xl:grid-cols-[24rem_minmax(0,1fr)]">
+              <AutomationHistorySidebar
+                snapshot={snapshot}
+                focusedRunId=""
+                onSelectRun={onSelectRun}
+                onDeleteRun={onDeleteRun}
+                deletingRunId={deletingRunId}
+              />
+
+              <section className="min-w-0">
+                <Card>
+                  <CardContent className="py-10">
+                    <Empty>
+                      <EmptyHeader>
+                        <EmptyTitle>No hay workflows todavía</EmptyTitle>
+                        <EmptyDescription>
+                          Lanza el workflow para iniciar el paso 1 y ver aquí el detalle del proceso.
+                        </EmptyDescription>
+                      </EmptyHeader>
+                    </Empty>
+                  </CardContent>
+                </Card>
+              </section>
+            </div>
+          </main>
+        </div>
+      );
+    }
+
+    return (
+      <div className="min-h-screen bg-background">
+        <main className="container mx-auto max-w-6xl px-4 py-8 sm:px-6">
+          {error ? <StatusMessage text={error} /> : null}
+          <Card>
+            <CardContent className="py-8">
+              <Empty>
+                <EmptyHeader>
+                  <EmptyTitle>{error ? "No se pudo conectar con el panel" : "No hay workflows todavía"}</EmptyTitle>
+                  <EmptyDescription>
+                    {error
+                      ? "El dashboard no recibio el estado inicial. Si acabas de borrar el historial, el sistema debe levantar igual con una base vacia."
+                      : "Lanza el workflow para cargar la corrida."}
+                  </EmptyDescription>
+                </EmptyHeader>
+              </Empty>
+            </CardContent>
+          </Card>
+        </main>
+      </div>
+    );
+  }
+
+  const header = buildWorkflowHeader(focusedRun, snapshot);
+  const stepTwoReady = snapshot.runtime.stepTwoReady;
+  const stepAction =
+    activeStep?.id === STEP_TWO_STAGE_ID
+      ? {
+          label: "Ejecutar solo paso 2",
+          disabled: snapshot.runtime.isRunning || !stepTwoReady.available,
+          loading: pendingAction === "step-2",
+          hint: snapshot.runtime.isRunning
+            ? "Espera a que termine la ejecución actual para volver a abrir SUNAT."
+            : stepTwoReady.message,
+        }
+      : undefined;
+
+  return (
+    <div className="min-h-screen bg-background">
+      <WorkflowHeader
+        workflowName={header.workflowName}
+        status={header.status}
+        branch={header.branch}
+        totalDuration={header.totalDuration}
+        completedSteps={header.completedSteps}
+        totalSteps={header.totalSteps}
+        onStartRun={onStartRun}
+        onStopRun={onStopRun}
+        isRunning={snapshot.runtime.isRunning}
+        isStopping={pendingAction === "stop"}
+      />
+
+      <main className="container mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:py-8">
+        {error ? <StatusMessage text={error} /> : null}
+        {flashMessage ? <StatusMessage text={flashMessage} /> : null}
+
+        <div className="grid gap-6 lg:grid-cols-[22rem_minmax(0,1fr)] xl:grid-cols-[24rem_minmax(0,1fr)]">
+          <AutomationHistorySidebar
+            snapshot={snapshot}
+            focusedRunId={focusedRun.id}
+            onSelectRun={onSelectRun}
+            onDeleteRun={onDeleteRun}
+            deletingRunId={deletingRunId}
+          />
+
+          <section className="min-w-0">
+            <div className="mb-6 rounded-2xl border bg-card p-6">
+              <WorkflowStepper
+                steps={workflowSteps}
+                activeStepId={activeStepId}
+                onStepSelect={(stepId) => {
+                  if (selectedRunId !== focusedRun.id) {
+                    onSelectRun(focusedRun.id);
+                  }
+                  setActiveStepId(stepId);
+                  onSelectStage(stepId);
+                }}
+              />
+            </div>
+
+            {activeStep ? (
+              <StepDetails
+                step={activeStep}
+                stepNumber={activeStepNumber}
+                action={stepAction}
+                onAction={stepAction ? onStartStepTwo : undefined}
+              />
+            ) : null}
+          </section>
+        </div>
+      </main>
+    </div>
+  );
+}
+
+export function App() {
+  const { snapshot, streamState, error, refresh } = useDashboardState();
+  const selection = useDashboardSelection(snapshot);
+  const [flashMessage, setFlashMessage] = useState<string | null>(null);
+  const [pendingAction, setPendingAction] = useState<"run-all" | "step-2" | "stop" | null>(null);
+  const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
+  const preferredBaseUrl = snapshot?.config.baseUrl;
+
+  useEffect(() => {
+    if (!flashMessage) {
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      setFlashMessage(null);
+    }, 4000);
+
+    return () => {
+      window.clearTimeout(timeout);
+    };
+  }, [flashMessage]);
+
+  const actions = useMemo(
+    () => ({
+      async onStartRun() {
+        setPendingAction("run-all");
+        try {
+          setFlashMessage(await requestAction("/api/run/manual", { preferredBaseUrl }));
+          refresh();
+        } finally {
+          setPendingAction(null);
+        }
+      },
+      async onStopRun() {
+        setPendingAction("stop");
+        try {
+          setFlashMessage(await requestAction("/api/run/stop", { preferredBaseUrl }));
+          refresh();
+        } finally {
+          setPendingAction(null);
+        }
+      },
+      async onStartStepTwo() {
+        setPendingAction("step-2");
+        try {
+          setFlashMessage(await requestAction("/api/run/step-2", { preferredBaseUrl }));
+          refresh();
+        } finally {
+          setPendingAction(null);
+        }
+      },
+      async onApprove(attemptId: string) {
+        setFlashMessage(await requestAction(`/api/attempts/${attemptId}/approve`, { preferredBaseUrl }));
+        refresh();
+      },
+      async onCancel(attemptId: string) {
+        setFlashMessage(await requestAction(`/api/attempts/${attemptId}/cancel`, { preferredBaseUrl }));
+        refresh();
+      },
+      async onRetry(attemptId: string) {
+        setFlashMessage(await requestAction(`/api/attempts/${attemptId}/retry`, { preferredBaseUrl }));
+        refresh();
+      },
+      async onDeleteRun(runId: string) {
+        setDeletingRunId(runId);
+        try {
+          setFlashMessage(
+            await requestAction(`/api/runs/${runId}`, {
+              method: "DELETE",
+              preferredBaseUrl,
+            }),
+          );
+          refresh();
+        } finally {
+          setDeletingRunId(null);
+        }
+      },
+    }),
+    [preferredBaseUrl, refresh],
+  );
+
+  return (
+    <DashboardWorkspace
+      snapshot={snapshot}
+      streamState={streamState}
+      error={error}
+      flashMessage={flashMessage}
+      selectedRunId={selection.selectedRunId}
+      selectedStageId={selection.selectedStageId}
+      onStartRun={() => void actions.onStartRun()}
+      onStopRun={() => void actions.onStopRun()}
+      onStartStepTwo={() => void actions.onStartStepTwo()}
+      onSelectRun={(runId) => selection.openRun(runId)}
+      onDeleteRun={(runId) => void actions.onDeleteRun(runId)}
+      onCloseRun={() => selection.closeRun()}
+      onSelectStage={(stageId) => selection.selectStage(stageId)}
+      onApprove={(attemptId) => void actions.onApprove(attemptId)}
+      onCancel={(attemptId) => void actions.onCancel(attemptId)}
+      onRetry={(attemptId) => void actions.onRetry(attemptId)}
+      pendingAction={pendingAction}
+      deletingRunId={deletingRunId}
+    />
+  );
+}
