@@ -1,9 +1,12 @@
+import fs from "node:fs";
+import path from "node:path";
 import { describe, expect, test } from "vitest";
 import {
   addItemButtonSelectors,
   customerContinueSelectors,
   customerDocumentSelectors,
   customerNameSelectors,
+  extractSunatReceiptPrefix,
   splitIgv,
 } from "../src/browser";
 
@@ -48,5 +51,26 @@ describe("browser helpers", () => {
     expect(documentSelectors).toContain("xpath=//*[@id='boleta.numeroDocumento']");
     expect(nameSelectors[0]).toBe("#boleta\\.razonSocial");
     expect(nameSelectors).toContain("xpath=//*[@id='boleta.razonSocial']");
+  });
+
+  test("extracts the SUNAT receipt prefix from the emitted number", () => {
+    expect(extractSunatReceiptPrefix("EB01-598")).toBe("EB01");
+  });
+
+  test("uses the exact SUNAT ids for the final emit flow in the active profiles", () => {
+    const customProfile = JSON.parse(
+      fs.readFileSync(path.join(process.cwd(), "config/custom-profile.json"), "utf8"),
+    ) as { sunat: Record<string, string> };
+    const dolphinProfile = JSON.parse(
+      fs.readFileSync(path.join(process.cwd(), "config/dolphin-profile.json"), "utf8"),
+    ) as { sunat: Record<string, string> };
+
+    for (const profile of [customProfile, dolphinProfile]) {
+      expect(profile.sunat.finalSubmitSelector).toBe("#boleta-preliminar\\.botonGrabarDocumento");
+      expect(profile.sunat.confirmAcceptSelector).toBe("#dlgBtnAceptarConfirm_label");
+      expect(profile.sunat.successSelector).toBe("#numeroComprobante");
+      expect(profile.sunat.receiptNumberSelector).toBe("#numeroComprobante");
+      expect(profile.sunat.pdfDownloadSelector).toBe("#dijit_form_Button_2_label");
+    }
   });
 });

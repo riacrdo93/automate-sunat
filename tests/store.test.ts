@@ -59,13 +59,14 @@ describe("RunStore", () => {
     store.setSaleStatus(sale.externalId, "drafted", attemptId);
     store.markAttemptReadyForReview(attemptId, []);
     store.setSaleStatus(sale.externalId, "ready_for_review", attemptId);
-    store.markAttemptSubmitted(attemptId, [], "F-12345");
+    store.markAttemptSubmitted(attemptId, [], "EB01-12345", "EB01");
     store.setSaleStatus(sale.externalId, "submitted", attemptId);
 
     const attempt = store.getAttempt(attemptId);
 
     expect(attempt?.status).toBe("submitted");
-    expect(attempt?.receiptNumber).toBe("F-12345");
+    expect(attempt?.receiptNumber).toBe("EB01-12345");
+    expect(attempt?.receiptPrefix).toBe("EB01");
   });
 
   test("groups collected records inside launched automations", () => {
@@ -97,7 +98,7 @@ describe("RunStore", () => {
     expect(dashboard.runs[0]?.entries[0]?.documentProgress).toBe("Detalle leído");
   });
 
-  test("creates a ZIP export when attempts with a run are submitted", () => {
+  test("keeps receipt metadata without generating ZIP exports when attempts with a run are submitted", () => {
     const sale = normalizeSale({
       externalId: "SALE-ZIP",
       issuedAt: "2026-03-24T16:00:00-05:00",
@@ -117,16 +118,21 @@ describe("RunStore", () => {
     fs.writeFileSync(artifactPath, "fake-png", "utf8");
 
     const attemptId = store.createAttempt(sale.externalId, saleToInvoiceDraft(sale), runId);
-    store.markAttemptSubmitted(attemptId, [{ kind: "screenshot", path: artifactPath }], "B-0001");
+    store.markAttemptSubmitted(
+      attemptId,
+      [{ kind: "screenshot", path: artifactPath }],
+      "EB01-0001",
+      "EB01",
+    );
 
     const dashboard = store.getDashboardData();
     const summary = dashboard.runs[0]?.summary;
+    const runEntry = dashboard.runs[0]?.entries[0];
 
-    expect(typeof summary?.boletasZipPath).toBe("string");
-    expect(summary?.boletasZipPath).toContain("boletas-export");
-    expect(summary?.boletasZipPath).toContain(`${runId}-boletas-electronicas.zip`);
-    expect(summary?.boletasZipCount).toBe(1);
-    expect(fs.existsSync(summary!.boletasZipPath as string)).toBe(true);
+    expect(summary?.boletasZipPath).toBeUndefined();
+    expect(summary?.boletasZipCount).toBeUndefined();
+    expect(runEntry?.receiptNumber).toBe("EB01-0001");
+    expect(runEntry?.receiptPrefix).toBe("EB01");
   });
 
   test("deletes a run, its attempts, and managed files", () => {
@@ -157,6 +163,9 @@ describe("RunStore", () => {
     const artifactPath = path.join(dataDir, "screenshots", "delete-me.png");
     fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
     fs.writeFileSync(artifactPath, "fake-png", "utf8");
+    const boletasDownloadDir = path.join(dataDir, "boletas-descargadas", "2026-03-30_23-37-44");
+    fs.mkdirSync(boletasDownloadDir, { recursive: true });
+    fs.writeFileSync(path.join(boletasDownloadDir, "SALE-DELETE_EB01-20887766554.pdf"), "fake-pdf", "utf8");
 
     const attemptId = store.createAttempt(sale.externalId, saleToInvoiceDraft(sale), runId);
     store.setSaleStatus(sale.externalId, "drafted", attemptId);
@@ -164,6 +173,7 @@ describe("RunStore", () => {
     store.finishRun(runId, "completed", {
       outputJsonPath,
       outputJsonContent: JSON.stringify([{ orderNumber: sale.externalId }], null, 2),
+      boletasDownloadDir,
     });
 
     const result = store.deleteRun(runId);
@@ -175,5 +185,6 @@ describe("RunStore", () => {
     expect(dashboard.sales).toHaveLength(0);
     expect(fs.existsSync(outputJsonPath)).toBe(false);
     expect(fs.existsSync(artifactPath)).toBe(false);
+    expect(fs.existsSync(boletasDownloadDir)).toBe(false);
   });
 });

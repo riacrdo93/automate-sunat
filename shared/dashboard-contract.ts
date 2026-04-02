@@ -60,6 +60,7 @@ export interface InvoiceAttemptRecord {
   updatedAt: string;
   submittedAt?: string;
   receiptNumber?: string;
+  receiptPrefix?: string;
   error?: string;
 }
 
@@ -132,6 +133,7 @@ export interface DashboardRunEntry {
   artifacts: Artifact[];
   documentProgress?: string;
   receiptNumber?: string;
+  receiptPrefix?: string;
   error?: string;
 }
 

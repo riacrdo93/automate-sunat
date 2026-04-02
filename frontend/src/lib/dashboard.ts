@@ -190,7 +190,7 @@ export function buildFallbackWorkflow(run: DashboardRunRecord): WorkflowStage[] 
       id: "registrar_facturas_sunat",
       title: "Paso 2: Registro de boleta electrónica",
       description:
-        "Preparar, revisar y registrar la boleta en SUNAT; las boletas emitidas se agrupan en un ZIP de salida.",
+        "Preparar, validar automáticamente y registrar la boleta en SUNAT; los PDFs emitidos se guardan en una carpeta de salida.",
       status: stageTwoStatus,
       steps: [
         {
@@ -207,8 +207,8 @@ export function buildFallbackWorkflow(run: DashboardRunRecord): WorkflowStage[] 
         },
         {
           id: "esperar_revision",
-          title: "Esperar revision",
-          description: "Pausar antes del envio final para aprobacion manual.",
+          title: "Validación automática",
+          description: "Revisar el borrador y continuar al envío sin intervención humana.",
           status: stageTwoStatus,
         },
         {

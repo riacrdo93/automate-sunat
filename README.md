@@ -8,6 +8,10 @@ Automatización local por navegador que:
 - se pausa para tu revisión antes del envío final
 - muestra el estado en vivo en un panel en [http://localhost:3030](http://localhost:3030)
 
+## TODO
+
+- registrar facturas recorriendo todas las páginas y con soporte multicuentas
+
 ## Inicio rápido
 
 ```bash

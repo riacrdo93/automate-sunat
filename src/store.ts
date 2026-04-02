@@ -2,7 +2,6 @@ import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import Database from "better-sqlite3";
-import { writeBoletasZip } from "./boletas-zip";
 import {
   Artifact,
   DashboardRunEntry,
@@ -35,6 +34,7 @@ type AttemptRow = {
   artifacts_json: string;
   error: string | null;
   receipt_number: string | null;
+  receipt_prefix: string | null;
   created_at: string;
   updated_at: string;
   submitted_at: string | null;
@@ -148,8 +148,8 @@ export class RunStore {
     this.db
       .prepare(
         `
-        INSERT INTO invoice_attempts (id, sale_external_id, run_id, status, draft_json, artifacts_json, error, receipt_number, created_at, updated_at, submitted_at)
-        VALUES (@id, @sale_external_id, @run_id, @status, @draft_json, @artifacts_json, @error, @receipt_number, @created_at, @updated_at, @submitted_at)
+        INSERT INTO invoice_attempts (id, sale_external_id, run_id, status, draft_json, artifacts_json, error, receipt_number, receipt_prefix, created_at, updated_at, submitted_at)
+        VALUES (@id, @sale_external_id, @run_id, @status, @draft_json, @artifacts_json, @error, @receipt_number, @receipt_prefix, @created_at, @updated_at, @submitted_at)
       `,
       )
       .run({
@@ -161,6 +161,7 @@ export class RunStore {
         artifacts_json: JSON.stringify([]),
         error: null,
         receipt_number: null,
+        receipt_prefix: null,
         created_at: now,
         updated_at: now,
         submitted_at: null,
@@ -202,6 +203,7 @@ export class RunStore {
     attemptId: string,
     artifacts: Artifact[] = [],
     receiptNumber?: string,
+    receiptPrefix?: string,
   ): void {
     const row = this.getAttemptRow(attemptId);
     const merged = [...JSON.parse(row.artifacts_json) as Artifact[], ...artifacts];
@@ -214,6 +216,7 @@ export class RunStore {
         SET status = @status,
             artifacts_json = @artifacts_json,
             receipt_number = @receipt_number,
+            receipt_prefix = @receipt_prefix,
             submitted_at = @submitted_at,
             updated_at = @updated_at
         WHERE id = @id
@@ -224,14 +227,11 @@ export class RunStore {
         status: "submitted",
         artifacts_json: JSON.stringify(merged),
         receipt_number: receiptNumber ?? null,
+        receipt_prefix: receiptPrefix ?? null,
         submitted_at: now,
         updated_at: now,
       });
 
-    const runId = row.run_id;
-    if (runId) {
-      this.refreshBoletasExportZip(runId);
-    }
   }
 
   markAttemptFailed(attemptId: string, error: string, artifacts: Artifact[] = []): void {
@@ -458,14 +458,15 @@ export class RunStore {
       }
     });
     const dataRoot = path.dirname(this.dbPath);
-    const managedFiles = [
+    const managedPaths = [
       ...artifactPaths,
       typeof summary.outputJsonPath === "string" ? summary.outputJsonPath : undefined,
       typeof summary.boletasZipPath === "string" ? summary.boletasZipPath : undefined,
+      typeof summary.boletasDownloadDir === "string" ? summary.boletasDownloadDir : undefined,
     ].filter((value): value is string => Boolean(value));
 
-    for (const filePath of managedFiles) {
-      this.deleteManagedFile(filePath, dataRoot);
+    for (const filePath of managedPaths) {
+      this.deleteManagedPath(filePath, dataRoot);
     }
 
     return { deleted: true, message: "Workflow eliminado del historial." };
@@ -606,66 +607,6 @@ export class RunStore {
     return rows.map((row) => this.deserializeRunEntry(row));
   }
 
-  private mergeRunSummaryBoletasZip(runId: string, zipPath: string, submittedCount: number): void {
-    const row = this.db
-      .prepare("SELECT summary_json FROM runs WHERE id = ?")
-      .get(runId) as { summary_json: string } | undefined;
-
-    if (!row) {
-      return;
-    }
-
-    const summary = JSON.parse(row.summary_json || "{}") as Record<string, unknown>;
-    summary.boletasZipPath = zipPath;
-    summary.boletasZipCount = submittedCount;
-
-    const stages = summary.workflowStages;
-    if (Array.isArray(stages)) {
-      summary.workflowStages = stages.map((stage) => {
-        const typed = stage as WorkflowStage;
-        if (typed.id === "registrar_facturas_sunat") {
-          return {
-            ...typed,
-            outputPath: zipPath,
-            outputCount: submittedCount,
-          };
-        }
-        return typed;
-      });
-    }
-
-    this.db
-      .prepare(
-        `
-        UPDATE runs
-        SET summary_json = @summary_json
-        WHERE id = @id
-      `,
-      )
-      .run({
-        id: runId,
-        summary_json: JSON.stringify(summary),
-      });
-  }
-
-  private refreshBoletasExportZip(runId: string): void {
-    const entries = this.getRunEntriesForRun(runId);
-    const submittedCount = entries.filter((entry) => entry.status === "submitted").length;
-
-    if (!submittedCount) {
-      return;
-    }
-
-    const dataRoot = path.dirname(this.dbPath);
-    const zipPath = writeBoletasZip(dataRoot, runId, entries);
-
-    if (!zipPath) {
-      return;
-    }
-
-    this.mergeRunSummaryBoletasZip(runId, zipPath, submittedCount);
-  }
-
   private setAttemptStatus(attemptId: string, status: InvoiceAttemptRecord["status"]): void {
     this.db
       .prepare(
@@ -710,6 +651,7 @@ export class RunStore {
       updatedAt: row.updated_at,
       submittedAt: row.submitted_at ?? undefined,
       receiptNumber: row.receipt_number ?? undefined,
+      receiptPrefix: row.receipt_prefix ?? undefined,
       error: row.error ?? undefined,
     };
   }
@@ -735,6 +677,7 @@ export class RunStore {
       documentProgress:
         sale && typeof sale.raw.documentProgress === "string" ? sale.raw.documentProgress : undefined,
       receiptNumber: attempt.receiptNumber,
+      receiptPrefix: attempt.receiptPrefix,
       error: attempt.error,
     };
   }
@@ -783,19 +726,19 @@ export class RunStore {
     }
   }
 
-  private deleteManagedFile(filePath: string, dataRoot: string): void {
-    const resolvedPath = path.resolve(filePath);
+  private deleteManagedPath(targetPath: string, dataRoot: string): void {
+    const resolvedPath = path.resolve(targetPath);
     const resolvedRoot = path.resolve(dataRoot) + path.sep;
 
     if (!resolvedPath.startsWith(resolvedRoot)) {
       return;
     }
 
-    if (!fs.existsSync(resolvedPath) || fs.statSync(resolvedPath).isDirectory()) {
+    if (!fs.existsSync(resolvedPath)) {
       return;
     }
 
-    fs.rmSync(resolvedPath, { force: true });
+    fs.rmSync(resolvedPath, { force: true, recursive: true });
   }
 
   private initialize(): void {
@@ -820,6 +763,7 @@ export class RunStore {
         artifacts_json TEXT NOT NULL DEFAULT '[]',
         error TEXT,
         receipt_number TEXT,
+        receipt_prefix TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         submitted_at TEXT
@@ -836,6 +780,7 @@ export class RunStore {
     `);
 
     this.ensureColumn("invoice_attempts", "run_id", "TEXT");
+    this.ensureColumn("invoice_attempts", "receipt_prefix", "TEXT");
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_invoice_attempts_run_id ON invoice_attempts (run_id);`);
     this.backfillAttemptRunIds();
     this.finalizeInterruptedRuns();

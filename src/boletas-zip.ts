@@ -17,6 +17,7 @@ export function writeBoletasZip(dataRoot: string, runId: string, entries: Dashbo
       saleExternalId: entry.saleExternalId,
       attemptId: entry.attemptId,
       receiptNumber: entry.receiptNumber ?? null,
+      receiptPrefix: entry.receiptPrefix ?? null,
       artifacts: entry.artifacts.map((a) => ({ kind: a.kind, path: a.path })),
     })),
   };

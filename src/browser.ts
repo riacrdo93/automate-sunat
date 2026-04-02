@@ -14,6 +14,11 @@ import { SiteProfile } from "./profiles";
 
 export type StepReporter = (step: string) => void | Promise<void>;
 
+export interface SubmissionContext {
+  runId?: string;
+  boletasDownloadDir?: string;
+}
+
 export interface SellerSource {
   fetchSales(onStep: StepReporter): Promise<Sale[]>;
   refreshSale(externalId: string, onStep: StepReporter): Promise<Sale | undefined>;
@@ -26,6 +31,7 @@ export interface PreparedSubmission {
   submit(onStep: StepReporter): Promise<{
     artifacts: Artifact[];
     receiptNumber?: string;
+    receiptPrefix?: string;
   }>;
   cancel(onStep: StepReporter): Promise<Artifact[]>;
 }
@@ -35,6 +41,7 @@ export interface InvoiceEmitter {
     attemptId: string,
     draft: InvoiceDraft,
     onStep: StepReporter,
+    context?: SubmissionContext,
   ): Promise<PreparedSubmission>;
 }
 
@@ -291,37 +298,26 @@ export class FalabellaSellerSource implements SellerSource {
     try {
       await loginToFalabella(page, this.config.sellerCredentials, onStep);
       await openFalabellaDocumentsPage(page, this.config.sellerPurchasedOrdersUrl, onStep);
-      const orderIds = await collectFalabellaOrderIds(page);
+      const candidates = await collectFalabellaPendingRowsAcrossPages(page, onStep);
       const sales: Sale[] = [];
 
-      for (const orderId of orderIds) {
-        const row = await findFalabellaOrderRowByOrderId(page, orderId);
-        if (!row) {
-          continue;
-        }
-
-        const enabledOrder = await extractEnabledFalabellaRow(row, orderId);
-
-        if (!enabledOrder) {
-          continue;
-        }
-
-        if (enabledOrder.requestedDocumentType !== "Boleta") {
+      for (const candidate of candidates) {
+        if (candidate.requestedDocumentType !== "Boleta") {
           await onStep(
-            enabledOrder.requestedDocumentType
-              ? `Orden ${enabledOrder.externalId}: tipo ${enabledOrder.requestedDocumentType} detectado, se omite del flujo de boleta`
-              : `Orden ${enabledOrder.externalId}: no se pudo identificar si es boleta o factura, se omite`,
+            candidate.requestedDocumentType
+              ? `Orden ${candidate.externalId}: tipo ${candidate.requestedDocumentType} detectado, se omite del flujo de boleta`
+              : `Orden ${candidate.externalId}: no se pudo identificar si es boleta o factura, se omite`,
           );
           continue;
         }
 
-        await onStep(`Leyendo la orden ${enabledOrder.externalId} en Falabella`);
+        await onStep(`Leyendo la orden ${candidate.externalId} en Falabella`);
         const detailPage = await context.newPage();
 
         try {
           const sale = await readFalabellaSaleFromDetail(
             detailPage,
-            enabledOrder,
+            candidate,
             this.config,
           );
           sales.push(sale);
@@ -346,20 +342,14 @@ export class FalabellaSellerSource implements SellerSource {
     try {
       await loginToFalabella(page, this.config.sellerCredentials, onStep);
       await openFalabellaDocumentsPage(page, this.config.sellerPurchasedOrdersUrl, onStep);
-      const row = await findFalabellaOrderRowByOrderId(page, externalId);
-
-      if (!row) {
-        return undefined;
-      }
-
-      const enabledOrder = await extractEnabledFalabellaRow(row, externalId);
-      if (!enabledOrder || enabledOrder.requestedDocumentType !== "Boleta") {
+      const candidate = await findFalabellaPendingRowByOrderIdAcrossPages(page, externalId, onStep);
+      if (!candidate || candidate.requestedDocumentType !== "Boleta") {
         return undefined;
       }
 
       const detailPage = await context.newPage();
       try {
-        return await readFalabellaSaleFromDetail(detailPage, enabledOrder, this.config);
+        return await readFalabellaSaleFromDetail(detailPage, candidate, this.config);
       } finally {
         await detailPage.close().catch(() => undefined);
       }
@@ -416,6 +406,7 @@ export class SunatPortalEmitter implements InvoiceEmitter {
     attemptId: string,
     draft: InvoiceDraft,
     onStep: StepReporter,
+    submissionContext?: SubmissionContext,
   ): Promise<PreparedSubmission> {
     await onStep(`Abriendo el portal SUNAT para ${draft.saleExternalId}`);
 
@@ -423,8 +414,8 @@ export class SunatPortalEmitter implements InvoiceEmitter {
       headless: !this.config.headful,
       slowMo: this.config.slowMoMs,
     });
-    const context = await this.newContext(browser, "sunat.json");
-    const page = await context.newPage();
+    const browserContext = await this.newContext(browser, "sunat.json");
+    const page = await browserContext.newPage();
     const tracePath = path.join(this.config.dataPaths.tracesDir, `${attemptId}.zip`);
     const preSubmitScreenshot = path.join(
       this.config.dataPaths.screenshotsDir,
@@ -436,7 +427,7 @@ export class SunatPortalEmitter implements InvoiceEmitter {
     );
 
     try {
-      await context.tracing.start({ screenshots: true, snapshots: true });
+      await browserContext.tracing.start({ screenshots: true, snapshots: true });
       await this.loginIfNeeded(page, onStep);
 
       if (this.profile.sunat.postLoginMenuLabels?.length) {
@@ -452,23 +443,30 @@ export class SunatPortalEmitter implements InvoiceEmitter {
 
       await onStep(`Llenando la factura SUNAT para ${draft.saleExternalId}`);
       if (this.profile.sunat.customerDocumentTypeSelector) {
+        await onStep("Buscando el selector del tipo de documento del cliente.");
         const documentTypeField = await tryWaitForAnyVisibleLocatorInPageTree(
           page,
           customerDocumentTypeSelectors(this.profile.sunat.customerDocumentTypeSelector),
           10_000,
         );
         if (documentTypeField) {
+          await onStep("Selector del tipo de documento encontrado; ajustando opción.");
           await ensureCustomerDocumentType(documentTypeField.locator, draft.customer.documentNumber);
+        } else {
+          await onStep("No apareció un selector editable de tipo de documento; continúo con el flujo.");
         }
       }
 
+      await onStep("Buscando el campo del número de documento del cliente.");
       const customerDocumentField = await waitForAnyVisibleLocatorInPageTree(
         page,
         customerDocumentSelectors(this.profile.sunat.customerDocumentSelector),
         30_000,
       );
+      await onStep(`Campo documento encontrado (${await describeLocatorIdentity(customerDocumentField.locator)}).`);
       await customerDocumentField.locator.fill(draft.customer.documentNumber);
       await customerDocumentField.locator.press("Tab").catch(() => undefined);
+      await onStep("Documento ingresado; espero que SUNAT complete el nombre del cliente.");
       await page.waitForTimeout(3_000);
 
       await onStep(`Validando nombre del cliente en SUNAT para ${draft.saleExternalId}`);
@@ -480,6 +478,7 @@ export class SunatPortalEmitter implements InvoiceEmitter {
         onStep,
       );
 
+      await onStep("Buscando el primer botón Continuar de la boleta.");
       const continueButton = await tryWaitForBottomMostVisibleLocatorInPageTree(
         page,
         customerContinueSelectors(this.profile.sunat.customerContinueSelector ?? "text=Continuar"),
@@ -487,12 +486,16 @@ export class SunatPortalEmitter implements InvoiceEmitter {
         customerNameField.scope,
       );
       if (continueButton) {
+        await onStep("Encontré el primer Continuar y voy a hacer click.");
         await continueButton.locator.scrollIntoViewIfNeeded().catch(() => undefined);
         await continueButton.locator.click();
         await page.waitForTimeout(1_000);
+      } else {
+        await onStep("No encontré el primer Continuar; seguiré con los campos visibles.");
       }
 
       if (this.profile.sunat.issueDateSelector) {
+        await onStep("Revisando si la fecha de emisión se puede editar.");
         const issueDateField = await tryWaitForVisibleLocatorInPageTree(
           page,
           this.profile.sunat.issueDateSelector,
@@ -500,11 +503,13 @@ export class SunatPortalEmitter implements InvoiceEmitter {
           customerNameField.scope,
         );
         if (issueDateField && (await issueDateField.locator.isEditable().catch(() => false))) {
+          await onStep("Fecha de emisión editable encontrada; actualizando valor.");
           await issueDateField.locator.fill(draft.issueDate);
         }
       }
 
       if (this.profile.sunat.currencySelector) {
+        await onStep("Revisando selector de moneda en SUNAT.");
         const currencyField = await tryWaitForVisibleLocatorInPageTree(
           page,
           this.profile.sunat.currencySelector,
@@ -512,6 +517,7 @@ export class SunatPortalEmitter implements InvoiceEmitter {
           customerNameField.scope,
         );
         if (currencyField) {
+          await onStep("Selector de moneda encontrado; intento aplicar la moneda del draft.");
           await currencyField.locator.selectOption(draft.currency).catch(() => undefined);
         }
       }
@@ -553,13 +559,15 @@ export class SunatPortalEmitter implements InvoiceEmitter {
         attemptId,
         draft,
         browser,
-        context,
+        context: browserContext,
         page,
         tracePath,
         profile: this.profile,
         preSubmitArtifacts: [{ kind: "screenshot", path: preSubmitScreenshot }],
         config: this.config,
         onStep,
+        runId: submissionContext?.runId,
+        boletasDownloadDir: submissionContext?.boletasDownloadDir,
       });
     } catch (error) {
       const artifacts: Artifact[] = [];
@@ -569,8 +577,8 @@ export class SunatPortalEmitter implements InvoiceEmitter {
           artifacts.push({ kind: "screenshot", path: errorScreenshot });
         }
       }
-      await stopTraceSafely(context, tracePath, artifacts);
-      await context.close().catch(() => undefined);
+      await stopTraceSafely(browserContext, tracePath, artifacts);
+      await browserContext.close().catch(() => undefined);
       await browser.close().catch(() => undefined);
       throw normalizeAutomationError(error, artifacts);
     }
@@ -614,6 +622,8 @@ class PendingSunatSubmission implements PreparedSubmission {
       preSubmitArtifacts: Artifact[];
       config: AppConfig;
       onStep: StepReporter;
+      runId?: string;
+      boletasDownloadDir?: string;
     },
   ) {
     this.interruptionSignal = new Promise<string>((resolve) => {
@@ -640,7 +650,11 @@ class PendingSunatSubmission implements PreparedSubmission {
     return this.interruptionSignal;
   }
 
-  async submit(onStep: StepReporter): Promise<{ artifacts: Artifact[]; receiptNumber?: string }> {
+  async submit(onStep: StepReporter): Promise<{
+    artifacts: Artifact[];
+    receiptNumber?: string;
+    receiptPrefix?: string;
+  }> {
     const confirmationScreenshot = path.join(
       this.params.config.dataPaths.screenshotsDir,
       `${this.params.attemptId}-sunat-confirmation.png`,
@@ -651,23 +665,30 @@ class PendingSunatSubmission implements PreparedSubmission {
       await onStep("Enviando factura en SUNAT");
       await continueSunatBoletaWizard(this.params.page, this.params.profile, onStep);
 
+      await onStep("Buscando el botón Emitir de la preliminar.");
       const submitButton = await waitForVisibleLocatorInPageTree(
         this.params.page,
         this.params.profile.sunat.finalSubmitSelector,
         30_000,
       );
+      await onStep(`Botón Emitir encontrado (${await describeLocatorIdentity(submitButton.locator)}); haré click.`);
       await submitButton.locator.click();
+      await onStep("Click en Emitir realizado; esperando la confirmación.");
+      await waitForSunatProcessingToSettle(this.params.page, "la emisión preliminar", onStep, 25_000);
       await this.params.page.waitForTimeout(750);
 
       if (this.params.profile.sunat.confirmAcceptSelector) {
-        const acceptButton = await tryWaitForVisibleLocatorInPageTree(
+        await onStep("Esperando el botón Aceptar de la confirmación.");
+        const acceptButton = await waitForVisibleLocatorInPageTree(
           this.params.page,
           this.params.profile.sunat.confirmAcceptSelector,
           10_000,
         );
-        if (acceptButton) {
-          await acceptButton.locator.click();
-        }
+        await onStep(`Botón Aceptar encontrado (${await describeLocatorIdentity(acceptButton.locator)}); haré click.`);
+        await acceptButton.locator.click();
+        await onStep("Click en Aceptar realizado; esperando el comprobante emitido.");
+        await waitForSunatProcessingToSettle(this.params.page, "la confirmación de emisión", onStep, 30_000);
+        await this.params.page.waitForTimeout(750);
       }
 
       await this.params.page.waitForLoadState("domcontentloaded").catch(() => undefined);
@@ -685,25 +706,37 @@ class PendingSunatSubmission implements PreparedSubmission {
         throw new AutomationError(validation?.trim() || "SUNAT devolvió un error de validación.", artifacts);
       }
 
-      await waitForVisibleLocatorInPageTree(
+      await onStep("Esperando el número de comprobante emitido.");
+      const successMarker = await waitForVisibleLocatorInPageTree(
         this.params.page,
         this.params.profile.sunat.successSelector,
         30_000,
       );
+      await onStep(`Pantalla final detectada (${await describeLocatorIdentity(successMarker.locator)}).`);
       await this.params.page.screenshot({ path: confirmationScreenshot, fullPage: true });
       artifacts.push({ kind: "screenshot", path: confirmationScreenshot });
       await this.params.context.storageState({
         path: path.join(this.params.config.dataPaths.authDir, "sunat.json"),
       });
 
-      const receiptNumber = await readSunatReceiptNumber(this.params.page, this.params.profile);
+      await onStep("Leyendo el número de comprobante emitido.");
+      const receiptInfo = await readSunatReceiptInfo(this.params.page, this.params.profile);
+      await onStep(`Comprobante leído: ${receiptInfo.receiptNumber}.`);
+      await onStep(`Prefijo del comprobante detectado: ${receiptInfo.receiptPrefix}.`);
+      await onStep(
+        `Carpeta de boletas de esta corrida: ${this.params.boletasDownloadDir ?? path.join(this.params.config.dataPaths.rootDir, "boletas-descargadas")}.`,
+      );
       const downloadedFiles = await downloadSunatReceiptFiles(
         this.params.page,
         this.params.profile,
         this.params.config,
-        this.params.draft.saleExternalId,
-        this.params.draft.customer.documentNumber,
-        receiptNumber,
+        {
+          saleExternalId: this.params.draft.saleExternalId,
+          customerDocumentNumber: this.params.draft.customer.documentNumber,
+          receiptPrefix: receiptInfo.receiptPrefix,
+          boletasDownloadDir: this.params.boletasDownloadDir,
+        },
+        onStep,
       );
       artifacts.push(...downloadedFiles.map((path) => ({ kind: "file" as const, path })));
 
@@ -724,7 +757,8 @@ class PendingSunatSubmission implements PreparedSubmission {
 
       return {
         artifacts,
-        receiptNumber,
+        receiptNumber: receiptInfo.receiptNumber,
+        receiptPrefix: receiptInfo.receiptPrefix,
       };
     } catch (error) {
       const failureScreenshot = path.join(
@@ -925,27 +959,122 @@ async function openFalabellaDocumentsPage(
   await page.locator("tbody tr[data-row-key]").first().waitFor({ state: "visible", timeout: 30_000 });
 }
 
-async function collectFalabellaOrderIds(page: Page): Promise<string[]> {
+type FalabellaPaginationState = {
+  currentPage: number;
+  totalPages: number;
+  hasNextPage: boolean;
+  nextPage?: number;
+};
+
+async function collectFalabellaPendingRowsAcrossPages(
+  page: Page,
+  onStep: StepReporter,
+): Promise<FalabellaRowCandidate[]> {
+  await ensureFalabellaDocumentsStartFromFirstPage(page, onStep);
+  const collected = new Map<string, FalabellaRowCandidate>();
+  const visitedPageStates = new Set<string>();
+  let visitedPages = 0;
+
+  while (true) {
+    await waitForFalabellaDocumentsRows(page);
+    const pagination = await readFalabellaPaginationState(page);
+    const pageState = await buildFalabellaPageStateKey(page, pagination.currentPage);
+
+    if (visitedPageStates.has(pageState)) {
+      break;
+    }
+
+    visitedPageStates.add(pageState);
+    visitedPages += 1;
+
+    await onStep(
+      pagination.totalPages > 1
+        ? `Documentos tributarios: revisando página ${pagination.currentPage} de ${pagination.totalPages}.`
+        : "Documentos tributarios: revisando la única página disponible.",
+    );
+
+    const pageCandidates = await collectFalabellaPendingRowsFromCurrentPage(page);
+    for (const candidate of pageCandidates) {
+      if (!collected.has(candidate.externalId)) {
+        collected.set(candidate.externalId, candidate);
+      }
+    }
+
+    if (!pagination.hasNextPage) {
+      break;
+    }
+
+    await onStep(
+      pagination.nextPage
+        ? `Documentos tributarios: avanzando a la página ${pagination.nextPage}.`
+        : "Documentos tributarios: avanzando a la siguiente página.",
+    );
+    await goToNextFalabellaDocumentsPage(page, pagination.currentPage, pageState);
+  }
+
+  await onStep(
+    `Documentos tributarios: revisé ${visitedPages} página(s) y encontré ${collected.size} orden(es) con documento pendiente.`,
+  );
+  return Array.from(collected.values());
+}
+
+async function findFalabellaPendingRowByOrderIdAcrossPages(
+  page: Page,
+  orderId: string,
+  onStep: StepReporter,
+): Promise<FalabellaRowCandidate | undefined> {
+  await ensureFalabellaDocumentsStartFromFirstPage(page, onStep);
+  const visitedPageStates = new Set<string>();
+
+  while (true) {
+    await waitForFalabellaDocumentsRows(page);
+    const pagination = await readFalabellaPaginationState(page);
+    const pageState = await buildFalabellaPageStateKey(page, pagination.currentPage);
+
+    if (visitedPageStates.has(pageState)) {
+      return undefined;
+    }
+
+    visitedPageStates.add(pageState);
+    await onStep(
+      pagination.totalPages > 1
+        ? `Documentos tributarios: buscando la orden ${orderId} en la página ${pagination.currentPage} de ${pagination.totalPages}.`
+        : `Documentos tributarios: buscando la orden ${orderId} en la página disponible.`,
+    );
+
+    const row = await findFalabellaOrderRowByOrderId(page, orderId);
+    if (row) {
+      return extractEnabledFalabellaRow(row, orderId);
+    }
+
+    if (!pagination.hasNextPage) {
+      return undefined;
+    }
+
+    await goToNextFalabellaDocumentsPage(page, pagination.currentPage, pageState);
+  }
+}
+
+async function collectFalabellaPendingRowsFromCurrentPage(page: Page): Promise<FalabellaRowCandidate[]> {
   const rows = page.locator("tbody tr[data-row-key]");
   await rows.first().waitFor({ state: "visible", timeout: 30_000 });
   const count = await rows.count();
-  const orderIds: string[] = [];
+  const candidates: FalabellaRowCandidate[] = [];
 
   for (let index = 0; index < count; index += 1) {
     const row = rows.nth(index);
-    const orderId = await row
-      .locator("a[href*='/order/view/number/']")
-      .first()
-      .textContent({ timeout: 1_000 })
-      .catch(() => "");
-    const externalId = ((orderId ?? "").match(/\d+/)?.[0] ?? "").trim();
+    const externalId = await readFalabellaRowOrderId(row);
+    if (!externalId) {
+      continue;
+    }
 
-    if (externalId) {
-      orderIds.push(externalId);
+    const candidate = await extractEnabledFalabellaRow(row, externalId);
+    if (candidate) {
+      candidates.push(candidate);
     }
   }
 
-  return Array.from(new Set(orderIds));
+  return candidates;
 }
 
 async function findFalabellaOrderRowByOrderId(page: Page, orderId: string): Promise<Locator | undefined> {
@@ -960,6 +1089,190 @@ async function findFalabellaOrderRowByOrderId(page: Page, orderId: string): Prom
 
   const visible = await row.isVisible().catch(() => false);
   return visible ? row : undefined;
+}
+
+async function readFalabellaRowOrderId(row: Locator): Promise<string> {
+  const orderId = await row
+    .locator("a[href*='/order/view/number/']")
+    .first()
+    .textContent({ timeout: 1_000 })
+    .catch(() => "");
+
+  return ((orderId ?? "").match(/\d+/)?.[0] ?? "").trim();
+}
+
+async function waitForFalabellaDocumentsRows(page: Page): Promise<void> {
+  await page.locator("tbody tr[data-row-key]").first().waitFor({ state: "visible", timeout: 30_000 });
+}
+
+async function ensureFalabellaDocumentsStartFromFirstPage(
+  page: Page,
+  onStep?: StepReporter,
+): Promise<void> {
+  await waitForFalabellaDocumentsRows(page);
+  let pagination = await readFalabellaPaginationState(page);
+
+  if (pagination.currentPage <= 1) {
+    return;
+  }
+
+  await onStep?.(
+    `Documentos tributarios: empezaré desde la página 1 para recopilar toda la información (ahora estoy en la ${pagination.currentPage}).`,
+  );
+
+  const firstPageControl = await findFalabellaPaginationPageControl(page, 1);
+  if (firstPageControl) {
+    const previousState = await buildFalabellaPageStateKey(page, pagination.currentPage);
+    await firstPageControl.scrollIntoViewIfNeeded().catch(() => undefined);
+    await firstPageControl.click({ noWaitAfter: true }).catch(() => undefined);
+    await waitForFalabellaDocumentsPageChange(page, pagination.currentPage, previousState);
+    await onStep?.("Documentos tributarios: ya estoy en la página 1.");
+    return;
+  }
+
+  while (pagination.currentPage > 1) {
+    const previousControl = await findFalabellaPreviousPaginationControl(page);
+
+    if (!previousControl) {
+      throw new Error(
+        "Falabella abrió Documentos tributarios en una página interna y no encontré cómo volver a la página 1.",
+      );
+    }
+
+    const previousState = await buildFalabellaPageStateKey(page, pagination.currentPage);
+    await previousControl.scrollIntoViewIfNeeded().catch(() => undefined);
+    await previousControl.click({ noWaitAfter: true }).catch(() => undefined);
+    await waitForFalabellaDocumentsPageChange(page, pagination.currentPage, previousState);
+    pagination = await readFalabellaPaginationState(page);
+  }
+
+  await onStep?.("Documentos tributarios: ya estoy en la página 1.");
+}
+
+async function buildFalabellaPageStateKey(page: Page, currentPage: number): Promise<string> {
+  const firstRowKey = await page
+    .locator("tbody tr[data-row-key]")
+    .first()
+    .getAttribute("data-row-key")
+    .catch(() => null);
+
+  return `${currentPage}:${firstRowKey ?? "no-row"}`;
+}
+
+async function readFalabellaPaginationState(page: Page): Promise<FalabellaPaginationState> {
+  const pageLabels = (await page.locator("li.ant-pagination-item").allTextContents().catch(() => []))
+    .map((label) => label.replace(/\s+/g, " ").trim())
+    .map((label) => Number(label))
+    .filter((value) => Number.isFinite(value) && value > 0);
+
+  const currentLabel = ((await page
+    .locator("li.ant-pagination-item-active")
+    .first()
+    .textContent()
+    .catch(() => "")) ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const currentPage = Number(currentLabel) || 1;
+  const totalPages = pageLabels.length ? Math.max(...pageLabels) : currentPage;
+  const nextItem = page.locator("li.ant-pagination-next").first();
+  const nextVisible = await nextItem.isVisible().catch(() => false);
+  const nextDisabled =
+    !nextVisible
+    || (await nextItem.getAttribute("aria-disabled").catch(() => null)) === "true"
+    || (await nextItem.evaluate((element) => element.classList.contains("ant-pagination-disabled")).catch(() => false));
+
+  return {
+    currentPage,
+    totalPages,
+    hasNextPage: nextVisible && !nextDisabled,
+    nextPage: nextVisible && !nextDisabled ? currentPage + 1 : undefined,
+  };
+}
+
+async function goToNextFalabellaDocumentsPage(
+  page: Page,
+  currentPage: number,
+  previousState: string,
+): Promise<void> {
+  const nextControl = await findFalabellaNextPaginationControl(page);
+
+  if (!nextControl) {
+    throw new Error("No se encontró el botón para avanzar a la siguiente página de Documentos tributarios.");
+  }
+
+  await nextControl.scrollIntoViewIfNeeded().catch(() => undefined);
+  await nextControl.click({ noWaitAfter: true }).catch(() => undefined);
+  await waitForFalabellaDocumentsPageChange(page, currentPage, previousState);
+}
+
+async function findFalabellaPaginationPageControl(
+  page: Page,
+  targetPage: number,
+): Promise<Locator | undefined> {
+  const control = page
+    .locator("li.ant-pagination-item")
+    .filter({ hasText: new RegExp(`^\\s*${targetPage}\\s*$`) })
+    .first();
+
+  return (await control.isVisible().catch(() => false)) ? control : undefined;
+}
+
+async function findFalabellaNextPaginationControl(page: Page): Promise<Locator | undefined> {
+  const candidates = [
+    page.locator("li.ant-pagination-next button").first(),
+    page.locator("li.ant-pagination-next").first(),
+  ];
+
+  for (const candidate of candidates) {
+    if (await candidate.isVisible().catch(() => false)) {
+      return candidate;
+    }
+  }
+
+  return undefined;
+}
+
+async function findFalabellaPreviousPaginationControl(page: Page): Promise<Locator | undefined> {
+  const candidates = [
+    page.locator("li.ant-pagination-prev button").first(),
+    page.locator("li.ant-pagination-prev").first(),
+  ];
+
+  for (const candidate of candidates) {
+    if (await candidate.isVisible().catch(() => false)) {
+      const disabled =
+        (await candidate.getAttribute("aria-disabled").catch(() => null)) === "true"
+        || (await candidate
+          .evaluate((element) => element.classList.contains("ant-pagination-disabled"))
+          .catch(() => false));
+      if (!disabled) {
+        return candidate;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+async function waitForFalabellaDocumentsPageChange(
+  page: Page,
+  previousPage: number,
+  previousState: string,
+): Promise<void> {
+  const deadline = Date.now() + 30_000;
+
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(300);
+    const pagination = await readFalabellaPaginationState(page);
+    const currentState = await buildFalabellaPageStateKey(page, pagination.currentPage);
+
+    if (pagination.currentPage !== previousPage || currentState !== previousState) {
+      await waitForFalabellaDocumentsRows(page);
+      return;
+    }
+  }
+
+  throw new Error("Falabella no avanzó a la siguiente página de Documentos tributarios.");
 }
 
 async function extractEnabledFalabellaRow(
@@ -1640,12 +1953,45 @@ async function performLoginFlow(params: {
 async function navigateSunatSolMenu(page: Page, labels: string[], onStep: StepReporter): Promise<void> {
   for (const label of labels) {
     await onStep(`Menú SUNAT: ${label}`);
-    const target = page.getByText(label, { exact: true }).first();
-    await target.waitFor({ state: "visible", timeout: 45_000 });
+    const target = await waitForVisibleTextTargetInPageTree(page, label, 45_000);
     await target.scrollIntoViewIfNeeded();
     await target.click();
     await page.waitForTimeout(500);
   }
+}
+
+async function waitForVisibleTextTargetInPageTree(
+  page: Page,
+  label: string,
+  timeoutMs: number,
+): Promise<Locator> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    for (const scope of collectPageScopes(page)) {
+      const candidates = [
+        scope.getByRole("link", { name: label, exact: true }),
+        scope.getByRole("button", { name: label, exact: true }),
+        scope.getByText(label, { exact: true }),
+        scope.getByText(label),
+      ];
+
+      for (const candidate of candidates) {
+        const count = await candidate.count().catch(() => 0);
+
+        for (let index = 0; index < Math.min(count, 20); index += 1) {
+          const match = candidate.nth(index);
+          if (await match.isVisible().catch(() => false)) {
+            return match;
+          }
+        }
+      }
+    }
+
+    await page.waitForTimeout(250);
+  }
+
+  throw new Error(`No se encontró un menú SUNAT visible para "${label}".`);
 }
 
 async function waitForVisibleLocatorInPageTree(
@@ -1834,6 +2180,35 @@ function collectPageScopes(page: Page): PageScope[] {
   return [page, ...page.frames()];
 }
 
+async function isAnyVisibleLocatorInPageTree(
+  page: Page,
+  selectors: string[],
+  preferredScope?: PageScope,
+): Promise<boolean> {
+  const scopes = preferredScope
+    ? [preferredScope, ...collectPageScopes(page).filter((scope) => scope !== preferredScope)]
+    : collectPageScopes(page);
+
+  for (const scope of scopes) {
+    for (const selector of selectors) {
+      const locator = scope.locator(selector);
+      const count = await locator.count().catch(() => 0);
+
+      if (!count) {
+        continue;
+      }
+
+      for (let index = 0; index < Math.min(count, 20); index += 1) {
+        if (await locator.nth(index).isVisible().catch(() => false)) {
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
 async function describeVisibleControlsInPageTree(page: Page): Promise<string> {
   const summaries: string[] = [];
 
@@ -1906,6 +2281,46 @@ async function describeLocatorIdentity(locator: Locator): Promise<string> {
     .catch(() => "campo-desconocido");
 }
 
+async function waitForSunatProcessingToSettle(
+  page: Page,
+  label: string,
+  onStep?: StepReporter,
+  timeoutMs = 20_000,
+): Promise<void> {
+  const processingVisible = await tryWaitForAnyVisibleLocatorInPageTree(
+    page,
+    sunatProcessingMarkers(),
+    4_000,
+  );
+
+  if (!processingVisible) {
+    return;
+  }
+
+  await onStep?.(`SUNAT está procesando ${label}; esperaré con más calma.`);
+  const deadline = Date.now() + timeoutMs;
+  let nextProgressLogAt = Date.now() + 5_000;
+
+  while (Date.now() < deadline) {
+    const stillProcessing = await isAnyVisibleLocatorInPageTree(page, sunatProcessingMarkers());
+    if (!stillProcessing) {
+      await onStep?.(`SUNAT terminó de procesar ${label}.`);
+      return;
+    }
+
+    if (Date.now() >= nextProgressLogAt) {
+      await onStep?.(`SUNAT sigue procesando ${label}; continúo esperando.`);
+      nextProgressLogAt = Date.now() + 5_000;
+    }
+
+    await page.waitForTimeout(500);
+  }
+
+  await onStep?.(
+    `SUNAT sigue procesando ${label} después de ${Math.round(timeoutMs / 1_000)}s; revisaré si la pantalla cambió igual.`,
+  );
+}
+
 function truncateForLog(value: string, maxLength: number): string {
   if (value.length <= maxLength) {
     return value;
@@ -1914,48 +2329,88 @@ function truncateForLog(value: string, maxLength: number): string {
   return `${value.slice(0, Math.max(0, maxLength - 1))}…`;
 }
 
-async function readSunatReceiptNumber(page: Page, profile: SiteProfile): Promise<string | undefined> {
+async function readSunatReceiptInfo(
+  page: Page,
+  profile: SiteProfile,
+): Promise<{ receiptNumber: string; receiptPrefix: string }> {
   const selector = profile.sunat.receiptNumberSelector;
+  const candidates: string[] = [];
 
   if (selector) {
     const locator = await tryWaitForVisibleLocatorInPageTree(page, selector, 5_000);
     if (locator) {
-      const value = await readLocatorValue(locator.locator);
-      const match = value.match(/[A-Z]{1,4}\d{0,2}-\d+/i);
-      if (match) {
-        return match[0].toUpperCase();
-      }
+      candidates.push(await readLocatorValue(locator.locator));
     }
   }
 
   const bodyText = (await page.locator("body").textContent().catch(() => "")) ?? "";
-  const match = bodyText.match(/[A-Z]{1,4}\d{0,2}-\d+/i);
-  return match?.[0]?.toUpperCase();
+  candidates.push(bodyText);
+
+  for (const candidate of candidates) {
+    const receiptNumber = extractSunatReceiptNumber(candidate);
+    if (!receiptNumber) {
+      continue;
+    }
+
+    const receiptPrefix = extractSunatReceiptPrefix(receiptNumber);
+    if (!receiptPrefix) {
+      break;
+    }
+
+    return {
+      receiptNumber,
+      receiptPrefix,
+    };
+  }
+
+  throw new Error("SUNAT mostró la pantalla final, pero no pude leer el número del comprobante emitido.");
+}
+
+function extractSunatReceiptNumber(rawValue: string): string | undefined {
+  return rawValue.match(/[A-Z]{1,4}\d{0,2}-\d+/i)?.[0]?.toUpperCase();
 }
 
 async function downloadSunatReceiptFiles(
   page: Page,
   profile: SiteProfile,
   config: AppConfig,
-  orderNumber: string,
-  customerDocumentNumber: string,
-  receiptNumber?: string,
+  params: {
+    saleExternalId: string;
+    customerDocumentNumber: string;
+    receiptPrefix: string;
+    boletasDownloadDir?: string;
+  },
+  onStep?: StepReporter,
 ): Promise<string[]> {
-  const downloadsDir = path.join(config.dataPaths.rootDir, "boletas-descargadas");
+  const downloadsDir =
+    params.boletasDownloadDir ?? path.join(config.dataPaths.rootDir, "boletas-descargadas");
   fs.mkdirSync(downloadsDir, { recursive: true });
-  const prefix = extractSunatReceiptPrefix(receiptNumber);
-  const baseName = `${orderNumber}_${prefix}-${customerDocumentNumber}`;
-  const downloadedFiles: string[] = [];
 
-  if (profile.sunat.pdfDownloadSelector) {
-    const pdfPath = await triggerSunatDownload(page, profile.sunat.pdfDownloadSelector, path.join(downloadsDir, `${baseName}.pdf`));
-    if (pdfPath) {
-      downloadedFiles.push(pdfPath);
-    }
+  const baseName = `${params.saleExternalId}_${params.receiptPrefix}-${params.customerDocumentNumber}`;
+  const downloadedFiles: string[] = [];
+  const pdfSelector = profile.sunat.pdfDownloadSelector;
+
+  if (!pdfSelector) {
+    throw new Error("Falta el selector configurado para descargar el PDF de SUNAT.");
   }
 
+  await onStep?.("Buscando el botón Descargar PDF.");
+  const pdfButton = await waitForVisibleLocatorInPageTree(page, pdfSelector, 15_000);
+  await onStep?.(`Botón Descargar PDF encontrado (${await describeLocatorIdentity(pdfButton.locator)}).`);
+  await onStep?.("Descarga del PDF iniciada.");
+
+  const pdfTargetPath = path.join(downloadsDir, `${baseName}.pdf`);
+  const pdfDownload = await waitForSunatDownload(page, pdfButton.locator);
+  if (!pdfDownload) {
+    throw new Error("SUNAT no inició la descarga del PDF de la boleta.");
+  }
+  await pdfDownload.saveAs(pdfTargetPath);
+  downloadedFiles.push(pdfTargetPath);
+  await onStep?.(`PDF guardado en ${pdfTargetPath}.`);
+
   if (profile.sunat.xmlDownloadSelector) {
-    const xmlPath = await triggerSunatDownload(page, profile.sunat.xmlDownloadSelector, path.join(downloadsDir, `${baseName}.xml`));
+    const xmlTargetPath = path.join(downloadsDir, `${baseName}.xml`);
+    const xmlPath = await triggerSunatDownload(page, profile.sunat.xmlDownloadSelector, xmlTargetPath);
     if (xmlPath) {
       downloadedFiles.push(xmlPath);
     }
@@ -1964,9 +2419,10 @@ async function downloadSunatReceiptFiles(
   return downloadedFiles;
 }
 
-function extractSunatReceiptPrefix(receiptNumber?: string): string {
-  const token = (receiptNumber || "").match(/[A-Z]{1,4}\d{0,2}/i)?.[0];
-  return (token || "EB01").toUpperCase();
+export function extractSunatReceiptPrefix(receiptNumber?: string): string | undefined {
+  const token = receiptNumber?.split("-")[0]?.trim();
+  const normalized = token?.match(/[A-Z]{1,4}\d{0,2}/i)?.[0];
+  return normalized?.toUpperCase();
 }
 
 async function triggerSunatDownload(
@@ -1990,6 +2446,7 @@ async function triggerSunatDownload(
 
 async function waitForSunatDownload(page: Page, locator: Locator): Promise<Download | undefined> {
   try {
+    await locator.scrollIntoViewIfNeeded().catch(() => undefined);
     const [download] = await Promise.all([
       page.waitForEvent("download", { timeout: 20_000 }),
       locator.click(),
@@ -2112,6 +2569,7 @@ async function continueSunatBoletaWizard(
   await onStep?.("Encontré Continuar y voy a hacer click.");
   await firstContinue.locator.scrollIntoViewIfNeeded().catch(() => undefined);
   await firstContinue.locator.click();
+  await waitForSunatProcessingToSettle(page, "el primer Continuar", onStep, 20_000);
   await page.waitForTimeout(1_000);
 
   const optionalMarker = await tryWaitForAnyVisibleLocatorInPageTree(
@@ -2121,6 +2579,7 @@ async function continueSunatBoletaWizard(
   );
 
   if (!optionalMarker) {
+    await resolveAdditionalSunatTransportStep(page, profile, onStep);
     return;
   }
 
@@ -2128,13 +2587,21 @@ async function continueSunatBoletaWizard(
   await onStep?.("SUNAT mostró una pantalla opcional; hago click en Continuar otra vez.");
   await secondContinue.locator.scrollIntoViewIfNeeded().catch(() => undefined);
   await secondContinue.locator.click();
+  await waitForSunatProcessingToSettle(page, "la pantalla opcional", onStep, 60_000);
   await page.waitForTimeout(1_000);
 
+  await onStep?.("Verificando si SUNAT ya avanzó desde la pantalla opcional.");
   await waitForAnyVisibleLocatorInPageTree(
     page,
-    [...preliminarySunatStepMarkers(), profile.sunat.finalSubmitSelector ?? ""].filter(Boolean),
-    30_000,
+    [
+      ...preliminarySunatStepMarkers(),
+      profile.sunat.finalSubmitSelector ?? "",
+      ...additionalSunatTransportStepMarkers(),
+    ].filter(Boolean),
+    45_000,
   );
+
+  await resolveAdditionalSunatTransportStep(page, profile, onStep);
 }
 
 function optionalSunatStepMarkers(): string[] {
@@ -2143,6 +2610,95 @@ function optionalSunatStepMarkers(): string[] {
     "text=Consigne las observaciones de la Boleta de Venta",
     "text=Consigne Información Relacionada a la Boleta de Venta",
     "text=Informacion Relacionada",
+  ]);
+}
+
+async function resolveAdditionalSunatTransportStep(
+  page: Page,
+  profile: SiteProfile,
+  onStep?: StepReporter,
+): Promise<void> {
+  const transportMarker = await tryWaitForAnyVisibleLocatorInPageTree(
+    page,
+    additionalSunatTransportStepMarkers(),
+    2_000,
+  );
+
+  if (!transportMarker) {
+    return;
+  }
+
+  await onStep?.(
+    "SUNAT abrió la pantalla adicional de traslado / información complementaria.",
+  );
+
+  const transportAcceptButton = await tryWaitForVisibleLocatorInPageTree(
+    page,
+    "#trasladoBienes\\.botonAceptar",
+    5_000,
+  );
+
+  if (!transportAcceptButton) {
+    throw new Error(
+      "SUNAT abrió la pantalla adicional de traslado, pero no pude encontrar el botón Aceptar para continuar.",
+    );
+  }
+
+  await onStep?.(
+    `Intentaré aceptar la pantalla adicional (${await describeLocatorIdentity(
+      transportAcceptButton.locator,
+    )}) con los valores actuales.`,
+  );
+  await transportAcceptButton.locator.scrollIntoViewIfNeeded().catch(() => undefined);
+  await transportAcceptButton.locator.click().catch(() => undefined);
+  await page.waitForTimeout(1_000);
+
+  const nextMarker = await tryWaitForAnyVisibleLocatorInPageTree(
+    page,
+    [
+      ...preliminarySunatStepMarkers(),
+      profile.sunat.finalSubmitSelector ?? "",
+      ...additionalSunatTransportStepMarkers(),
+    ].filter(Boolean),
+    10_000,
+  );
+
+  if (!nextMarker) {
+    throw new Error(
+      "SUNAT abrió la pantalla adicional de traslado y no avanzó después de intentar Aceptar.",
+    );
+  }
+
+  const isStillTransportStep = await tryWaitForAnyVisibleLocatorInPageTree(
+    page,
+    additionalSunatTransportStepMarkers(),
+    1_000,
+  );
+  if (isStillTransportStep) {
+    throw new Error(
+      "SUNAT abrió la pantalla adicional de traslado y siguió visible después de Aceptar. Faltan datos de traslado o direcciones para continuar.",
+    );
+  }
+
+  await onStep?.("La pantalla adicional de traslado ya no está visible; continúo con la preliminar.");
+}
+
+function additionalSunatTransportStepMarkers(): string[] {
+  return uniqueSelectors([
+    "text=Información Adicional de la Boleta de Venta Electrónica",
+    "text=Informacion Adicional de la Boleta de Venta Electronica",
+    "text=Información para sustento del traslado sin Guía de Remisión",
+    "text=Informacion para sustento del traslado sin Guia de Remision",
+    "#trasladoBienes\\.botonAceptar",
+  ]);
+}
+
+function sunatProcessingMarkers(): string[] {
+  return uniqueSelectors([
+    "#waitMessage",
+    "text=Procesando...",
+    "text=Procesando",
+    ".dijitDialogUnderlay",
   ]);
 }
 
@@ -2174,6 +2730,7 @@ async function addItemsViaSunatModal(
     const item = draft.items[index];
     const sanitizedDescription = sanitizeSunatItemDescription(item.description);
     await onStep(`Agregando item ${index + 1} de ${draft.items.length} en SUNAT`);
+    await onStep(`Buscando el botón Adicionar para el item ${index + 1}.`);
 
     const addButton = await waitForAnyVisibleLocatorInPageTree(
       page,
@@ -2181,6 +2738,7 @@ async function addItemsViaSunatModal(
       30_000,
       preferredScope,
     );
+    await onStep(`Botón Adicionar encontrado; abriendo el modal del item ${index + 1}.`);
     await addButton.locator.click();
 
     const dialog = await waitForAnyVisibleLocatorInPageTree(
@@ -2189,6 +2747,7 @@ async function addItemsViaSunatModal(
       30_000,
       addButton.scope,
     );
+    await onStep(`Modal del item ${index + 1} abierto; completaré los campos.`);
 
     await selectSunatItemKindAsGood(page, dialog.scope);
 
@@ -2199,6 +2758,7 @@ async function addItemsViaSunatModal(
       dialog.scope,
     );
     await quantityField.locator.fill(String(item.quantity));
+    await onStep(`Cantidad del item ${index + 1} registrada: ${item.quantity}.`);
 
     if (profile.sunat.itemUnitMeasureSelector) {
       const unitMeasureField = await tryWaitForAnyVisibleLocatorInPageTree(
@@ -2219,6 +2779,7 @@ async function addItemsViaSunatModal(
       dialog.scope,
     );
     await descriptionField.locator.fill(sanitizedDescription);
+    await onStep(`Descripción del item ${index + 1} registrada.`);
 
     await selectSunatTaxCategory(page, dialog.scope, profile, draft);
 
@@ -2230,9 +2791,12 @@ async function addItemsViaSunatModal(
       dialog.scope,
     );
     await typeIntoSunatCurrencyField(page, unitPriceField.locator, unitPriceValue);
+    await onStep(`Precio del item ${index + 1} registrado: ${unitPriceValue}.`);
     await triggerSunatItemAmountUpdate(page);
+    await onStep(`Esperando que SUNAT calcule los montos del item ${index + 1}.`);
     await waitForSunatItemAmountPreview(page, dialog.scope);
 
+    await onStep(`Buscando el botón Aceptar del item ${index + 1}.`);
     const acceptButton = await waitForAnyVisibleLocatorInPageTree(
       page,
       itemAcceptSelectors(itemAcceptSelector),

@@ -40,7 +40,7 @@ const activeWorkflowStages: WorkflowStage[] = [
   {
     id: "registrar_facturas_sunat",
     title: "Paso 2: Registro de boleta electrónica",
-    description: "Emision y registro de boletas en SUNAT; salida agrupada en ZIP.",
+    description: "Emision y registro de boletas en SUNAT; salida en carpeta con PDFs.",
     status: "pending",
     steps: [
       {
@@ -57,8 +57,8 @@ const activeWorkflowStages: WorkflowStage[] = [
       },
       {
         id: "esperar_revision",
-        title: "Esperar revision",
-        description: "Esperar la decision humana antes del envio.",
+        title: "Validación automática",
+        description: "Validar el borrador y continuar al envío sin intervención humana.",
         status: "pending",
       },
       {

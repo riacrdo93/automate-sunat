@@ -5,6 +5,7 @@ import {
   InvoiceEmitter,
   PreparedSubmission,
   SellerSource,
+  SubmissionContext,
   StepReporter,
 } from "../src/browser";
 import { loadConfig } from "../src/config";
@@ -65,11 +66,16 @@ class FakePreparedSubmission implements PreparedSubmission {
     return new Promise(() => undefined);
   }
 
-  async submit(onStep: StepReporter): Promise<{ artifacts: Artifact[]; receiptNumber?: string }> {
+  async submit(onStep: StepReporter): Promise<{
+    artifacts: Artifact[];
+    receiptNumber?: string;
+    receiptPrefix?: string;
+  }> {
     await onStep("Validando borrador antes del envio");
     return {
       artifacts: [{ kind: "screenshot", path: "/tmp/fake-submit.png" }],
-      receiptNumber: "F-99999",
+      receiptNumber: "EB01-99999",
+      receiptPrefix: "EB01",
     };
   }
 
@@ -80,6 +86,8 @@ class FakePreparedSubmission implements PreparedSubmission {
 
 class InterruptiblePreparedSubmission implements PreparedSubmission {
   private resolveInterruption?: (message: string) => void;
+  private resolveSubmitStarted?: () => void;
+  private submitStarted = false;
   readonly preSubmitArtifacts: Artifact[];
 
   constructor() {
@@ -96,11 +104,25 @@ class InterruptiblePreparedSubmission implements PreparedSubmission {
     this.resolveInterruption?.(message);
   }
 
-  async submit(_onStep: StepReporter): Promise<{ artifacts: Artifact[]; receiptNumber?: string }> {
-    return {
-      artifacts: [{ kind: "screenshot", path: "/tmp/fake-submit.png" }],
-      receiptNumber: "F-INTERRUPTED",
-    };
+  waitUntilSubmitStarts(): Promise<void> {
+    if (this.submitStarted) {
+      return Promise.resolve();
+    }
+
+    return new Promise<void>((resolve) => {
+      this.resolveSubmitStarted = resolve;
+    });
+  }
+
+  async submit(onStep: StepReporter): Promise<{
+    artifacts: Artifact[];
+    receiptNumber?: string;
+    receiptPrefix?: string;
+  }> {
+    await onStep("Validando borrador antes del envio");
+    this.submitStarted = true;
+    this.resolveSubmitStarted?.();
+    return new Promise(() => undefined);
   }
 
   async cancel(_onStep: StepReporter): Promise<Artifact[]> {
@@ -113,6 +135,7 @@ class FakeEmitter implements InvoiceEmitter {
     _attemptId: string,
     _draft: InvoiceDraft,
     _onStep: StepReporter,
+    _context?: SubmissionContext,
   ): Promise<PreparedSubmission> {
     return new FakePreparedSubmission([{ kind: "screenshot", path: "/tmp/fake-review.png" }]);
   }
@@ -125,6 +148,7 @@ class InterruptibleEmitter implements InvoiceEmitter {
     _attemptId: string,
     _draft: InvoiceDraft,
     _onStep: StepReporter,
+    _context?: SubmissionContext,
   ): Promise<PreparedSubmission> {
     const submission = new InterruptiblePreparedSubmission();
     this.submissions.push(submission);
@@ -183,7 +207,7 @@ describe("AutomationCoordinator", () => {
     expect(currentCoordinator.getSnapshot().runtime.pendingApprovals).toHaveLength(0);
   });
 
-  test("ejecuta paso 2 SUNAT cuando hay ventas y se aprueba el intento", async () => {
+  test("ejecuta paso 2 SUNAT sin intervención manual cuando hay ventas", async () => {
     const sale = normalizeSale({
       externalId: "SALE-COORD-1",
       issuedAt: "2026-03-24T12:00:00-05:00",
@@ -215,28 +239,39 @@ describe("AutomationCoordinator", () => {
 
     const runPromise = currentCoordinator.triggerManualRun();
 
-    await waitUntil(() => currentCoordinator.getSnapshot().runtime.pendingApprovals.length > 0);
-    const attemptId = currentCoordinator.getSnapshot().runtime.pendingApprovals[0]!.attemptId;
-    currentCoordinator.approveAttempt(attemptId);
-
     await waitUntil(() => currentCoordinator.getSnapshot().runtime.isRunning === false);
     await runPromise;
 
-    const attempts = currentCoordinator.getSnapshot().attempts;
-    const runs = currentCoordinator.getSnapshot().runs;
+    const snapshot = currentCoordinator.getSnapshot();
+    const attempts = snapshot.attempts;
+    const runs = snapshot.runs;
+    const attemptId = attempts[0]?.id;
+    const submittedAttempt = attempts.find((a) => a.id === attemptId);
+    const runEntry = runs[0]?.entries.find((entry) => entry.attemptId === attemptId);
 
     expect(attempts.some((a) => a.id === attemptId && a.status === "submitted")).toBe(true);
+    expect(submittedAttempt?.receiptNumber).toBe("EB01-99999");
+    expect(submittedAttempt?.receiptPrefix).toBe("EB01");
+    expect(runEntry?.receiptPrefix).toBe("EB01");
     expect(runs[0]?.workflowStages[1]?.status).toBe("completed");
     expect(runs[0]?.outputJsonPath).toContain("/falabella-extract/");
     expect(runs[0]?.outputJsonContent).toContain("SALE-COORD-1");
     expect(runs[0]?.outputJsonContent).toContain("\"dni\": \"20101010101\"");
     expect(runs[0]?.outputJsonContent).toContain("\"productCount\": 1");
     expect(runs[0]?.outputJsonContent).toContain("\"total\": 350");
+    expect(runs[0]?.outputJsonContent).toContain("\"receiptNumber\": \"EB01-99999\"");
+    expect(runs[0]?.outputJsonContent).toContain("\"receiptPrefix\": \"EB01\"");
+    expect(typeof runs[0]?.summary.boletasDownloadDir).toBe("string");
+    expect(String(runs[0]?.summary.boletasDownloadDir)).toContain("/boletas-descargadas/");
     expect(runs[0]?.logs.some((log) => /JSON del paso 1/i.test(log.message))).toBe(true);
     expect(runs[0]?.logs.some((log) => /Sincronizando cookies del seller/i.test(log.message))).toBe(true);
+    expect(runs[0]?.logs.some((log) => /Validación automática completada/i.test(log.message))).toBe(
+      true,
+    );
+    expect(snapshot.runtime.pendingApprovals).toHaveLength(0);
   });
 
-  test("cancela toda la corrida si el operador cierra el navegador durante la revision", async () => {
+  test("cancela toda la corrida si el navegador se cierra durante el envío automático", async () => {
     const saleOne = normalizeSale({
       externalId: "SALE-CANCEL-1",
       issuedAt: "2026-03-24T12:00:00-05:00",
@@ -281,7 +316,8 @@ describe("AutomationCoordinator", () => {
 
     const runPromise = currentCoordinator.triggerManualRun();
 
-    await waitUntil(() => currentCoordinator.getSnapshot().runtime.pendingApprovals.length > 0);
+    await waitUntil(() => emitter.submissions.length > 0);
+    await emitter.submissions[0]!.waitUntilSubmitStarts();
     emitter.submissions[0]?.interrupt();
 
     await waitUntil(() => currentCoordinator.getSnapshot().runtime.isRunning === false);
@@ -299,7 +335,7 @@ describe("AutomationCoordinator", () => {
     expect(snapshot.runs[0]?.summary.cancelledInvoices).toBe(1);
   });
 
-  test("continua al paso 2 con ventas listas aunque otras ya esten en revision", async () => {
+  test("continua al paso 2 con ventas listas aunque otras ya esten en revision previa", async () => {
     const saleReady = normalizeSale({
       externalId: "SALE-READY-1",
       issuedAt: "2026-03-24T11:00:00-05:00",
@@ -346,22 +382,17 @@ describe("AutomationCoordinator", () => {
 
     const runPromise = currentCoordinator.triggerManualRun();
 
-    await waitUntil(() => currentCoordinator.getSnapshot().runtime.pendingApprovals.length > 0);
-    const pendingApprovals = currentCoordinator.getSnapshot().runtime.pendingApprovals;
-    expect(pendingApprovals).toHaveLength(1);
-    expect(pendingApprovals[0]?.saleExternalId).toBe("SALE-NEW-1");
-
-    currentCoordinator.approveAttempt(pendingApprovals[0]!.attemptId);
-
     await waitUntil(() => currentCoordinator.getSnapshot().runtime.isRunning === false);
     await runPromise;
 
-    const runs = currentCoordinator.getSnapshot().runs;
+    const snapshot = currentCoordinator.getSnapshot();
+    const runs = snapshot.runs;
     expect(runs[0]?.summary.queuedSales).toBe(1);
     expect(
       runs[0]?.logs.some((log) => /ya estaban en revisión o enviadas a SUNAT/i.test(log.message)),
     ).toBe(true);
     expect(runs[0]?.workflowStages[1]?.status).toBe("completed");
+    expect(snapshot.runtime.pendingApprovals).toHaveLength(0);
   });
 
   test("permite ejecutar solo el paso 2 con ventas guardadas del paso 1", async () => {
@@ -401,15 +432,12 @@ describe("AutomationCoordinator", () => {
 
     const runPromise = currentCoordinator.triggerStepTwoRun();
 
-    await waitUntil(() => currentCoordinator.getSnapshot().runtime.pendingApprovals.length > 0);
-    const attemptId = currentCoordinator.getSnapshot().runtime.pendingApprovals[0]!.attemptId;
-    currentCoordinator.approveAttempt(attemptId);
-
     await waitUntil(() => currentCoordinator.getSnapshot().runtime.isRunning === false);
     await runPromise;
 
     const snapshot = currentCoordinator.getSnapshot();
     const latestRun = snapshot.runs[0];
+    const attemptId = snapshot.attempts[0]?.id;
 
     expect(snapshot.attempts.some((attempt) => attempt.id === attemptId && attempt.status === "submitted")).toBe(
       true,
@@ -418,10 +446,16 @@ describe("AutomationCoordinator", () => {
     expect(latestRun?.workflowStages[0]?.status).toBe("completed");
     expect(latestRun?.workflowStages[1]?.status).toBe("completed");
     expect(latestRun?.logs.some((log) => /Paso 1 reutilizado/i.test(log.message))).toBe(true);
+    expect(latestRun?.logs.some((log) => /Carpeta de boletas de esta corrida/i.test(log.message))).toBe(
+      true,
+    );
     expect(latestRun?.logs.some((log) => /Sincronizando cookies del seller/i.test(log.message))).toBe(
       false,
     );
+    expect(latestRun?.outputJsonContent).toContain("\"receiptPrefix\": \"EB01\"");
+    expect(String(latestRun?.summary.boletasDownloadDir)).toContain("/boletas-descargadas/");
     expect(snapshot.runtime.stepTwoReady.available).toBe(false);
+    expect(snapshot.runtime.pendingApprovals).toHaveLength(0);
   });
 
   test("returns immediately when a manual run starts", async () => {

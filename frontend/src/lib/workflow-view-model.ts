@@ -261,18 +261,18 @@ function buildOutputs(
   }
 
   if (stage.id === REGISTRATION_STAGE_ID) {
-    const zipFromSummary =
-      typeof run.summary.boletasZipPath === "string" ? run.summary.boletasZipPath : undefined;
-    const zipPath =
-      zipFromSummary ?? (stage.outputPath?.toLowerCase().endsWith(".zip") ? stage.outputPath : undefined);
+    const folderFromSummary =
+      typeof run.summary.boletasDownloadDir === "string" ? run.summary.boletasDownloadDir : undefined;
+    const outputFolder =
+      folderFromSummary
+      ?? (stage.outputPath && !stage.outputPath.toLowerCase().endsWith(".zip") ? stage.outputPath : undefined);
 
-    if (zipPath) {
-      const count =
-        typeof run.summary.boletasZipCount === "number" ? run.summary.boletasZipCount : stage.outputCount;
+    if (outputFolder) {
+      const count = typeof stage.outputCount === "number" ? stage.outputCount : undefined;
       outputs.push({
         type: "text",
-        label: "ZIP de boletas electrónicas",
-        content: typeof count === "number" ? `${zipPath} (${count} boleta(s))` : zipPath,
+        label: "Carpeta de boletas electrónicas",
+        content: typeof count === "number" ? `${outputFolder} (${count} boleta(s))` : outputFolder,
       });
     }
   }
@@ -413,7 +413,7 @@ export function buildWorkflowSteps(run: DashboardRunRecord, snapshot: DashboardS
       buildStepView(registrationStage, run, snapshot, {
         name: "Registro de boleta electrónica",
         description:
-          "Emitimos las boletas en SUNAT con revisión humana cuando aplica; al finalizar, las evidencias se empaquetan como ZIP.",
+          "Emitimos las boletas en SUNAT con revisión humana cuando aplica; al finalizar, los PDFs quedan guardados en una carpeta.",
       }),
     );
   }

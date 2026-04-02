@@ -21,11 +21,6 @@ import {
 import { RunStore } from "./store";
 
 type ApprovalDecision = "approve" | "cancel";
-type ApprovalOutcome = {
-  decision: ApprovalDecision;
-  message?: string;
-  interrupted?: boolean;
-};
 
 type PendingApproval = {
   attemptId: string;
@@ -46,6 +41,7 @@ type RunProgress = {
   logs: WorkflowLogEntry[];
   outputJsonPath?: string;
   outputJsonContent?: string;
+  boletasDownloadDir?: string;
   currentWorkflowStageId?: string;
   currentWorkflowStepId?: string;
 };
@@ -178,7 +174,7 @@ export class AutomationCoordinator {
     if (!pending) {
       return {
         ok: false,
-        message: "Esa factura ya no est? esperando aprobaci?n en vivo. Usa reintentar para volver a abrirla.",
+        message: "Ya no hay aprobaciones manuales pendientes; el flujo ahora continúa automáticamente.",
       };
     }
 
@@ -192,7 +188,7 @@ export class AutomationCoordinator {
     if (!pending) {
       return {
         ok: false,
-        message: "Esa factura ya no est? esperando aprobaci?n en vivo.",
+        message: "Ya no hay aprobaciones manuales pendientes en vivo.",
       };
     }
 
@@ -232,7 +228,10 @@ export class AutomationCoordinator {
       runtime: {
         ...this.runtime,
         pendingApprovals: dashboardData.attempts
-          .filter((attempt) => attempt.status === "ready_for_review")
+          .filter(
+            (attempt) =>
+              attempt.status === "ready_for_review" && this.pendingApprovals.has(attempt.id),
+          )
           .map((attempt) => ({
             attemptId: attempt.id,
             saleExternalId: attempt.saleExternalId,
@@ -405,6 +404,8 @@ export class AutomationCoordinator {
       "abrir_sunat",
       "Iniciando paso 2: registro en SUNAT.",
     );
+    this.ensureRunOutputJson(runId, sales);
+    const boletasDownloadDir = this.ensureBoletasDownloadDir();
 
     for (const sale of sales) {
       const draft = saleToInvoiceDraft(sale);
@@ -418,6 +419,10 @@ export class AutomationCoordinator {
           attemptId,
           draft,
           this.stepReporter(sale.externalId),
+          {
+            runId,
+            boletasDownloadDir,
+          },
         );
       } catch (error) {
         if (error instanceof OperatorCancelledError) {
@@ -449,55 +454,44 @@ export class AutomationCoordinator {
         continue;
       }
 
-      this.store.markAttemptReadyForReview(attemptId, submission.preSubmitArtifacts);
-      this.store.setSaleStatus(sale.externalId, "ready_for_review", attemptId);
-
-      const approval = await this.waitForApproval(attemptId, sale.externalId, submission);
-
-      if (approval.decision === "cancel") {
-        cancelled += 1;
-        if (approval.interrupted) {
-          const interruptionMessage =
-            approval.message ?? "Flujo cancelado porque el operador cerr? el navegador.";
-          this.store.markAttemptFailed(attemptId, interruptionMessage);
-          this.store.setSaleStatus(sale.externalId, "failed", attemptId);
-          this.appendRunLog({
-            level: "error",
-            stageId: "registrar_facturas_sunat",
-            stepId: "esperar_revision",
-            message: interruptionMessage,
-            saleExternalId: sale.externalId,
-          });
-          this.syncRegistrationSummary(submitted, failed, cancelled);
-          this.publish();
-          throw new OperatorCancelledError(interruptionMessage);
-        }
-
-        try {
-          const cancelArtifacts = await submission.cancel(this.stepReporter(sale.externalId));
-          this.store.appendAttemptArtifacts(attemptId, cancelArtifacts);
-        } catch {
-          /* ignore */
-        }
-        this.store.markAttemptFailed(attemptId, "Cancelado por el operador.");
-        this.store.setSaleStatus(sale.externalId, "failed", attemptId);
-        this.appendRunLog({
-          level: "info",
-          stageId: "registrar_facturas_sunat",
-          stepId: "esperar_revision",
-          message: `Env?o cancelado para la orden ${sale.externalId}.`,
-          saleExternalId: sale.externalId,
-        });
-        this.syncRegistrationSummary(submitted, failed, cancelled);
-        this.publish();
-        continue;
-      }
+      this.store.appendAttemptArtifacts(attemptId, submission.preSubmitArtifacts);
+      this.completeWorkflowStep(
+        "registrar_facturas_sunat",
+        "cargar_factura_en_sunat",
+        `Borrador cargado en SUNAT para ${sale.externalId}.`,
+        sale.externalId,
+      );
+      this.advanceWorkflow(
+        "registrar_facturas_sunat",
+        "esperar_revision",
+        `Validación automática completada para ${sale.externalId}; continúo sin intervención manual.`,
+        sale.externalId,
+      );
+      this.completeWorkflowStep(
+        "registrar_facturas_sunat",
+        "esperar_revision",
+        `Validación automática lista para ${sale.externalId}.`,
+        sale.externalId,
+      );
 
       try {
-        const result = await submission.submit(this.stepReporter(sale.externalId));
+        const result = await this.submitPreparedSubmissionAutomatically(
+          submission,
+          this.stepReporter(sale.externalId),
+        );
         submitted += 1;
-        this.store.markAttemptSubmitted(attemptId, result.artifacts, result.receiptNumber);
+        this.store.markAttemptSubmitted(
+          attemptId,
+          result.artifacts,
+          result.receiptNumber,
+          result.receiptPrefix,
+        );
         this.store.setSaleStatus(sale.externalId, "submitted", attemptId);
+        this.enrichRunOutputWithReceiptMetadata(
+          sale.externalId,
+          result.receiptNumber,
+          result.receiptPrefix,
+        );
         this.completeWorkflowStep(
           "registrar_facturas_sunat",
           "enviar_factura",
@@ -549,7 +543,8 @@ export class AutomationCoordinator {
         "No se pudo completar el registro en SUNAT para ninguna venta.",
       );
     } else {
-      this.completeStage("registrar_facturas_sunat", submitted);
+      const boletasDownloadDir = submitted > 0 ? this.currentRunProgress().boletasDownloadDir : undefined;
+      this.completeStage("registrar_facturas_sunat", submitted, boletasDownloadDir);
     }
   }
 
@@ -562,51 +557,26 @@ export class AutomationCoordinator {
     this.activeRunPromise = trackedPromise;
   }
 
-  private waitForApproval(
-    attemptId: string,
-    saleExternalId: string,
+  private async submitPreparedSubmissionAutomatically(
     submission: PreparedSubmission,
-  ): Promise<ApprovalOutcome> {
-    this.runtime.currentStep = `Esperando aprobaci?n para ${saleExternalId}`;
-    const createdAt = new Date().toISOString();
-    this.advanceWorkflow(
-      "registrar_facturas_sunat",
-      "esperar_revision",
-      `La orden ${saleExternalId} quedó lista para revisión antes de enviarla a SUNAT.`,
-      saleExternalId,
-    );
+    onStep: StepReporter,
+  ): Promise<Awaited<ReturnType<PreparedSubmission["submit"]>>> {
+    const submissionOutcome = submission
+      .submit(onStep)
+      .then((result) => ({ kind: "submitted" as const, result }));
+    const interruptionOutcome = submission
+      .waitForInterruption()
+      .then((message) => ({ kind: "interrupted" as const, message }));
 
-    return new Promise<ApprovalOutcome>((resolve) => {
-      let settled = false;
-      const finish = (outcome: ApprovalOutcome) => {
-        if (settled) {
-          return;
-        }
+    const outcome = await Promise.race([submissionOutcome, interruptionOutcome]);
 
-        settled = true;
-        this.pendingApprovals.delete(attemptId);
-        resolve(outcome);
-      };
+    if (outcome.kind === "interrupted") {
+      throw new OperatorCancelledError(
+        outcome.message || "Flujo cancelado porque el navegador se cerró durante el envío.",
+      );
+    }
 
-      this.pendingApprovals.set(attemptId, {
-        attemptId,
-        saleExternalId,
-        createdAt,
-        resolve: (decision) => {
-          finish({ decision });
-        },
-      });
-
-      void submission.waitForInterruption().then((message) => {
-        finish({
-          decision: "cancel",
-          message,
-          interrupted: true,
-        });
-      });
-
-      this.publish();
-    });
+    return outcome.result;
   }
 
   private syncRegistrationSummary(submitted: number, failed: number, cancelled: number): void {
@@ -706,6 +676,7 @@ export class AutomationCoordinator {
       logs: progress.logs,
       outputJsonPath: progress.outputJsonPath,
       outputJsonContent: progress.outputJsonContent,
+      boletasDownloadDir: progress.boletasDownloadDir,
     };
   }
 
@@ -953,7 +924,7 @@ export class AutomationCoordinator {
       return { stageId: "registrar_facturas_sunat", stepId: "cargar_factura_en_sunat" };
     }
 
-    if (/Esperando aprobaci?n/i.test(step)) {
+    if (/Esperando aprobaci?n|Validaci[oó]n autom[aá]tica/i.test(step)) {
       return { stageId: "registrar_facturas_sunat", stepId: "esperar_revision" };
     }
 
@@ -968,7 +939,7 @@ export class AutomationCoordinator {
     const exportDir = path.join(this.config.dataPaths.rootDir, "falabella-extract");
     fs.mkdirSync(exportDir, { recursive: true });
     const runPath = path.join(exportDir, `${runId}.json`);
-    const latestPath = path.join(exportDir, "latest.json");
+    const latestPath = this.latestPendingSalesOutputPath();
     const payload = sales.map((sale) => ({
       orderNumber: sale.externalId,
       customerName: sale.customer.name,
@@ -984,6 +955,130 @@ export class AutomationCoordinator {
     fs.writeFileSync(runPath, content, "utf8");
     fs.writeFileSync(latestPath, content, "utf8");
     return { path: runPath, content };
+  }
+
+  private latestPendingSalesOutputPath(): string {
+    return path.join(this.config.dataPaths.rootDir, "falabella-extract", "latest.json");
+  }
+
+  private ensureRunOutputJson(runId: string, sales: Sale[]): void {
+    const progress = this.currentRunProgress();
+    if (progress.outputJsonPath && progress.outputJsonContent) {
+      return;
+    }
+
+    const output = this.writePendingSalesOutput(runId, sales);
+    progress.outputJsonPath = output.path;
+    progress.outputJsonContent = output.content;
+    this.appendRunLog({
+      level: "info",
+      stageId: "detectar_ventas",
+      stepId: "exportar_json",
+      message: `JSON del paso 1 recreado para esta corrida en ${output.path}.`,
+    });
+  }
+
+  private ensureBoletasDownloadDir(): string {
+    const progress = this.currentRunProgress();
+    if (progress.boletasDownloadDir) {
+      return progress.boletasDownloadDir;
+    }
+
+    const folderName = this.buildLimaTimestampFolderName();
+    const boletasDownloadDir = path.join(
+      this.config.dataPaths.rootDir,
+      "boletas-descargadas",
+      folderName,
+    );
+    fs.mkdirSync(boletasDownloadDir, { recursive: true });
+    progress.boletasDownloadDir = boletasDownloadDir;
+    this.appendRunLog({
+      level: "info",
+      stageId: "registrar_facturas_sunat",
+      stepId: "abrir_sunat",
+      message: `Carpeta de boletas de esta corrida: ${folderName} (${boletasDownloadDir}).`,
+    });
+    return boletasDownloadDir;
+  }
+
+  private buildLimaTimestampFolderName(date = new Date()): string {
+    const formatter = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "America/Lima",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    });
+    const parts = Object.fromEntries(
+      formatter
+        .formatToParts(date)
+        .filter((part) => part.type !== "literal")
+        .map((part) => [part.type, part.value]),
+    ) as Record<string, string>;
+
+    return `${parts.year}-${parts.month}-${parts.day}_${parts.hour}-${parts.minute}-${parts.second}`;
+  }
+
+  private enrichRunOutputWithReceiptMetadata(
+    saleExternalId: string,
+    receiptNumber?: string,
+    receiptPrefix?: string,
+  ): void {
+    const progress = this.currentRunProgress();
+    const rawContent = progress.outputJsonContent;
+    const outputJsonPath = progress.outputJsonPath;
+
+    if (!rawContent || !outputJsonPath) {
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(rawContent) as unknown;
+      if (!Array.isArray(parsed)) {
+        return;
+      }
+
+      let updated = false;
+      const nextContent = parsed.map((entry) => {
+        if (
+          !entry ||
+          typeof entry !== "object" ||
+          !("orderNumber" in entry) ||
+          entry.orderNumber !== saleExternalId
+        ) {
+          return entry;
+        }
+
+        updated = true;
+        return {
+          ...entry,
+          receiptNumber: receiptNumber ?? null,
+          receiptPrefix: receiptPrefix ?? null,
+        };
+      });
+
+      if (!updated) {
+        return;
+      }
+
+      const serialized = JSON.stringify(nextContent, null, 2);
+      progress.outputJsonContent = serialized;
+      fs.writeFileSync(outputJsonPath, serialized, "utf8");
+      fs.writeFileSync(this.latestPendingSalesOutputPath(), serialized, "utf8");
+      this.syncRunProgress();
+      this.appendRunLog({
+        level: "info",
+        stageId: "registrar_facturas_sunat",
+        stepId: "enviar_factura",
+        message: `JSON del run enriquecido con ${receiptNumber ?? receiptPrefix ?? "metadatos"} para la orden ${saleExternalId}.`,
+        saleExternalId,
+      });
+    } catch {
+      /* ignore malformed JSON and keep the run moving */
+    }
   }
 }
 
@@ -1026,7 +1121,7 @@ function buildWorkflowTemplate(): WorkflowStage[] {
       id: "registrar_facturas_sunat",
       title: "Paso 2: Registro de boleta electrónica",
       description:
-        "Tomar las ventas detectadas, preparar cada boleta, esperar revision y registrar en SUNAT; salida en ZIP con todas las boletas.",
+        "Tomar las ventas detectadas, preparar cada boleta, validarla automáticamente y registrarla en SUNAT; guardar los PDFs emitidos en una carpeta de salida.",
       status: "pending",
       steps: [
         {
@@ -1043,8 +1138,8 @@ function buildWorkflowTemplate(): WorkflowStage[] {
         },
         {
           id: "esperar_revision",
-          title: "Esperar revision",
-          description: "Pausar el flujo antes del envio final para aprobacion manual.",
+          title: "Validación automática",
+          description: "Revisar el borrador y continuar al envío sin intervención humana.",
           status: "pending",
         },
         {

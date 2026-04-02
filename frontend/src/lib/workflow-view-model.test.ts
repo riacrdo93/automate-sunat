@@ -51,7 +51,7 @@ describe("failed / ended runs", () => {
         },
         {
           id: "esperar_revision",
-          title: "Esperar revision",
+          title: "Validación automática",
           description: "",
           status: "pending" as const,
         },
@@ -181,6 +181,29 @@ describe("workflow stage focus", () => {
     expect(registrationStep?.logs[0]?.message).toContain("Paso 2 listo para abrir SUNAT");
     expect(registrationStep?.outputs.some((output) => output.label === "Preparacion SUNAT")).toBe(
       true,
+    );
+  });
+
+  it("shows the boletas PDF folder instead of a ZIP output", () => {
+    const snapshot = createSnapshot();
+    const run = createActiveRun();
+    run.workflowStages[1].outputCount = 2;
+    run.workflowStages[1].outputPath =
+      "/tmp/boletas-descargadas/2026-04-01_09-15-00";
+    run.summary.boletasDownloadDir =
+      "/tmp/boletas-descargadas/2026-04-01_09-15-00";
+
+    const registrationStep = buildWorkflowSteps(run, snapshot).find(
+      (step) => step.id === "registrar_facturas_sunat",
+    );
+    const folderOutput = registrationStep?.outputs.find(
+      (output) => output.label === "Carpeta de boletas electrónicas",
+    );
+
+    expect(folderOutput?.content).toContain("/tmp/boletas-descargadas/2026-04-01_09-15-00");
+    expect(folderOutput?.content).toContain("(2 boleta(s))");
+    expect(registrationStep?.outputs.some((output) => output.label === "ZIP de boletas electrónicas")).toBe(
+      false,
     );
   });
 });
