@@ -11,6 +11,7 @@ Automatización local por navegador que:
 ## TODO
 
 - registrar facturas recorriendo todas las páginas y con soporte multicuentas
+SDSD
 
 ## Inicio rápido
 
