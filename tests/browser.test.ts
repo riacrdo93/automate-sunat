@@ -1,13 +1,16 @@
 import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
+import type { InvoiceDraft } from "../shared/dashboard-contract";
 import {
   addItemButtonSelectors,
+  calculateSunatUnitPrice,
   customerContinueSelectors,
   customerDocumentSelectors,
   customerNameSelectors,
   extractSunatReceiptPrefix,
   falabellaDocumentsTextLooksEmpty,
+  formatSunatCurrency,
   splitIgv,
 } from "../src/browser";
 
@@ -18,6 +21,32 @@ describe("browser helpers", () => {
     expect(baseAmount).toBeCloseTo(84.66101694915254);
     expect(taxAmount).toBeCloseTo(15.23898305084746);
     expect(baseAmount + taxAmount).toBeCloseTo(99.9);
+  });
+
+  test("SUNAT: precio unitario neto se formatea con 6 decimales (evita total erróneo por redondeo)", () => {
+    const item = {
+      description: "x",
+      quantity: 6,
+      unitPrice: 1.33,
+      total: 7.99,
+      documentType: "Boleta",
+    };
+    const base = 7.99 / 1.18;
+    const draft: InvoiceDraft = {
+      id: "t",
+      saleExternalId: "t",
+      issueDate: "2026-01-01",
+      currency: "PEN",
+      customer: { name: "a", documentNumber: "1" },
+      items: [item],
+      totals: { subtotal: base, tax: 7.99 - base, total: 7.99 },
+    };
+    const unit = calculateSunatUnitPrice(item, draft);
+    const formatted = formatSunatCurrency(unit);
+
+    expect(formatted).toMatch(/^\d+\.\d{6}$/);
+    expect(formatted).toBe("1.128531");
+    expect(unit * 6 * 1.18).toBeCloseTo(7.99, 2);
   });
 
   test("prioritizes dojo add item selectors for SUNAT", () => {

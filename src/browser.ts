@@ -420,30 +420,28 @@ export class FalabellaSellerSource implements SellerSource {
     const page = await context.newPage();
 
     try {
-      await loginToFalabella(page, this.config.sellerCredentials, onStep);
+      await loginToFalabella(page, this.config.sellerCredentials, onStep, this.config.sellerPurchasedOrdersUrl);
       await openFalabellaDocumentsPage(page, this.config.sellerPurchasedOrdersUrl, onStep);
       const candidates = await collectFalabellaPendingRowsAcrossPages(page, onStep);
       const sales: Sale[] = [];
 
       for (const candidate of candidates) {
-        if (candidate.requestedDocumentType !== "Boleta") {
-          await onStep(
-            candidate.requestedDocumentType
-              ? `Orden ${candidate.externalId}: tipo ${candidate.requestedDocumentType} detectado, se omite del flujo de boleta`
-              : `Orden ${candidate.externalId}: no se pudo identificar si es boleta o factura, se omite`,
-          );
-          continue;
-        }
-
-        await onStep(`Leyendo la orden ${candidate.externalId} en Falabella`);
+        await onStep(`Abriendo detalle de la orden ${candidate.externalId} en Falabella`);
         const detailPage = await context.newPage();
 
         try {
-          const sale = await readFalabellaSaleFromDetail(
-            detailPage,
-            candidate,
-            this.config,
-          );
+          const detailMap = await waitForFalabellaOrderDetailReady(detailPage, candidate.detailUrl);
+
+          if (falabellaDetailIndicatesFactura(detailMap)) {
+            await onStep(
+              `Orden ${candidate.externalId}: en detalle «Documento tributario» es Factura; no la agrego y sigo con la siguiente.`,
+            );
+            continue;
+          }
+
+          const sale = await readFalabellaSaleFromDetail(detailPage, candidate, this.config, {
+            initialDetailMap: detailMap,
+          });
           sales.push(sale);
         } finally {
           await detailPage.close().catch(() => undefined);
@@ -464,16 +462,27 @@ export class FalabellaSellerSource implements SellerSource {
     const page = await context.newPage();
 
     try {
-      await loginToFalabella(page, this.config.sellerCredentials, onStep);
+      await loginToFalabella(page, this.config.sellerCredentials, onStep, this.config.sellerPurchasedOrdersUrl);
       await openFalabellaDocumentsPage(page, this.config.sellerPurchasedOrdersUrl, onStep);
       const candidate = await findFalabellaPendingRowByOrderIdAcrossPages(page, externalId, onStep);
-      if (!candidate || candidate.requestedDocumentType !== "Boleta") {
+      if (!candidate) {
         return undefined;
       }
 
       const detailPage = await context.newPage();
       try {
-        return await readFalabellaSaleFromDetail(detailPage, candidate, this.config);
+        const detailMap = await waitForFalabellaOrderDetailReady(detailPage, candidate.detailUrl);
+
+        if (falabellaDetailIndicatesFactura(detailMap)) {
+          await onStep(
+            `Orden ${candidate.externalId}: en detalle «Documento tributario» es Factura; no hay boleta que refrescar.`,
+          );
+          return undefined;
+        }
+
+        return await readFalabellaSaleFromDetail(detailPage, candidate, this.config, {
+          initialDetailMap: detailMap,
+        });
       } finally {
         await detailPage.close().catch(() => undefined);
       }
@@ -500,8 +509,7 @@ export class FalabellaSellerSource implements SellerSource {
     const page = await context.newPage();
 
     try {
-      await loginToFalabella(page, this.config.sellerCredentials, onStep);
-      await page.goto(detailUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      await loginToFalabella(page, this.config.sellerCredentials, onStep, detailUrl);
       await page.getByText(/Informaci[oó]n del cliente/i).first().waitFor({
         state: "visible",
         timeout: 30_000,
@@ -960,6 +968,9 @@ const FALABELLA_LOCAL_STORAGE_ENTRIES = [
   ],
 ] as const;
 
+/** Texto distintivo del modal de encuesta sobre la carga de documentos tributarios (Falabella Seller Center). */
+const FALABELLA_DOCUMENT_UPLOAD_FEEDBACK_MARKER = "experiencia de carga de documentos tributarios";
+
 async function launchBrowser(config: AppConfig): Promise<Browser> {
   return chromium.launch({
     headless: !config.headful,
@@ -979,58 +990,185 @@ async function newFalabellaContext(browser: Browser): Promise<BrowserContext> {
     }
   }, FALABELLA_LOCAL_STORAGE_ENTRIES);
 
+  await context.addInitScript((marker) => {
+    if (typeof window === "undefined" || !window.location.hostname.includes("sellercenter.falabella.com")) {
+      return;
+    }
+
+    const normalizedMarker = String(marker).toLowerCase();
+
+    function hideModalMaskForWrap(wrap: Element): void {
+      const root = wrap.closest(".ant-modal-root");
+      if (!root) {
+        return;
+      }
+      const mask = root.querySelector(":scope > .ant-modal-mask");
+      if (mask instanceof HTMLElement) {
+        mask.style.display = "none";
+      }
+    }
+
+    function dismissDocumentUploadFeedbackModal(): void {
+      try {
+        const wraps = document.querySelectorAll(".ant-modal-wrap");
+        for (let i = 0; i < wraps.length; i++) {
+          const wrap = wraps[i];
+          const text = (wrap.textContent || "").toLowerCase();
+          if (!text.includes(normalizedMarker)) {
+            continue;
+          }
+
+          const buttons = wrap.querySelectorAll("button");
+          for (let j = 0; j < buttons.length; j++) {
+            const label = (buttons[j].textContent || "").trim().toLowerCase();
+            if (label === "cancelar") {
+              buttons[j].click();
+              return;
+            }
+          }
+
+          const closeBtn = wrap.querySelector(".ant-modal-close, .ant-modal-close-x");
+          if (closeBtn instanceof HTMLElement) {
+            closeBtn.click();
+            return;
+          }
+
+          if (wrap instanceof HTMLElement) {
+            hideModalMaskForWrap(wrap);
+            wrap.style.display = "none";
+            wrap.style.pointerEvents = "none";
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+
+    function attachObserver(): void {
+      if (!document.body) {
+        return;
+      }
+      const observer = new MutationObserver(() => {
+        dismissDocumentUploadFeedbackModal();
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+      dismissDocumentUploadFeedbackModal();
+    }
+
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", attachObserver, { once: true });
+    } else {
+      attachObserver();
+    }
+  }, FALABELLA_DOCUMENT_UPLOAD_FEEDBACK_MARKER);
+
   return context;
+}
+
+/** Campo de contraseña visible en el login (Falabella cambia marcado; no siempre es `#password`). */
+async function findVisibleFalabellaLoginPasswordField(page: Page): Promise<Locator | undefined> {
+  const candidates: Locator[] = [
+    page.getByLabel(/^password$/i),
+    page.locator("#password"),
+    page.locator('input[type="password"]'),
+    page.locator('input[name="password" i]'),
+  ];
+
+  for (const candidate of candidates) {
+    const field = candidate.first();
+    if (await field.isVisible().catch(() => false)) {
+      return field;
+    }
+  }
+
+  return undefined;
 }
 
 async function loginToFalabella(
   page: Page,
   credentials: { username: string; password: string },
   onStep: StepReporter,
+  /** Primera carga y destino tras autenticar (p. ej. Documentos tributarios o URL de detalle de orden). */
+  entryUrl: string,
 ): Promise<void> {
   await onStep("Autenticando en Falabella Seller Center");
-  await page.goto("https://sellercenter.falabella.com/order", {
+  await onStep("Falabella login: abriendo la URL de destino en Seller Center (domcontentloaded, hasta 60s).");
+  await page.goto(entryUrl, {
     waitUntil: "domcontentloaded",
     timeout: 60_000,
   });
   await persistFalabellaLocalStorage(page);
-  const omitButton = page.getByRole("button", { name: /Omitir/i }).first();
   const emailField = page.locator("#email").first();
-  const passwordField = page.locator("#password").first();
   const ordersMenu = page.getByRole("link", { name: /Órdenes/i }).first();
+  const passwordRaceLocator = page.locator("#password, input[type='password']").first();
 
+  await onStep(
+    "Falabella login: buscando uno de: campo #email, contraseña o enlace Órdenes (espera hasta 8s).",
+  );
   await Promise.race([
     emailField.waitFor({ state: "visible", timeout: 8_000 }).catch(() => undefined),
-    passwordField.waitFor({ state: "visible", timeout: 8_000 }).catch(() => undefined),
-    omitButton.waitFor({ state: "visible", timeout: 8_000 }).catch(() => undefined),
+    passwordRaceLocator.waitFor({ state: "visible", timeout: 8_000 }).catch(() => undefined),
     ordersMenu.waitFor({ state: "visible", timeout: 8_000 }).catch(() => undefined),
   ]);
 
-  if (await omitButton.isVisible().catch(() => false)) {
-    await dismissFalabellaPopup(page);
-    return;
-  }
-
   if (await emailField.isVisible().catch(() => false)) {
+    await onStep("Falabella login: rellenando email.");
     await emailField.fill(credentials.username);
-    await page.locator("#submit").first().click({ noWaitAfter: true }).catch(() => undefined);
-    await passwordField.waitFor({ state: "visible", timeout: 30_000 }).catch(() => undefined);
+
+    let passwordField = await findVisibleFalabellaLoginPasswordField(page);
+
+    if (!passwordField) {
+      await onStep(
+        "Falabella login: contraseña aún no visible; pulso #submit para el paso de password (si aplica).",
+      );
+      await page.locator("#submit").first().click({ noWaitAfter: true }).catch(() => undefined);
+      await onStep("Falabella login: esperando campo de contraseña visible (hasta 30s).");
+      const deadline = Date.now() + 30_000;
+      while (!passwordField && Date.now() < deadline) {
+        await page.waitForTimeout(300);
+        passwordField = await findVisibleFalabellaLoginPasswordField(page);
+      }
+    }
   }
 
-  if (await passwordField.isVisible().catch(() => false)) {
-    await passwordField.fill(credentials.password);
+  let passwordField = await findVisibleFalabellaLoginPasswordField(page);
 
-    const signInButton = page.getByRole("button", { name: /Iniciar sesi[oó]n/i }).first();
+  if (passwordField) {
+    if (!String(credentials.password ?? "").trim()) {
+      await onStep(
+        "Falabella login: advertencia — la contraseña en configuración está vacía; no puedo iniciar sesión.",
+      );
+    } else {
+      await onStep("Falabella login: rellenando contraseña.");
+      await passwordField.click({ timeout: 5_000 }).catch(() => undefined);
+      await passwordField.fill(credentials.password);
+    }
+
+    const signInButton = page
+      .getByRole("button", { name: /Iniciar sesi[oó]n|Sign in|Login|Entrar/i })
+      .first();
+    await onStep(
+      "Falabella login: buscando botón de envío (Iniciar sesión / Login / Sign in / Entrar) y haciendo click.",
+    );
     await signInButton.click({ noWaitAfter: true }).catch(() => undefined);
     await waitForFalabellaPostLogin(page, 8_000);
 
-    if (await passwordField.isVisible().catch(() => false)) {
+    passwordField = await findVisibleFalabellaLoginPasswordField(page);
+    if (passwordField && (await passwordField.isVisible().catch(() => false))) {
+      await onStep("Falabella login: el formulario sigue visible; reintento click en botón de inicio de sesión.");
       await signInButton.click({ noWaitAfter: true }).catch(() => undefined);
       await waitForFalabellaPostLogin(page, 8_000);
     }
   }
 
   await waitForFalabellaPostLogin(page, 8_000);
-  await dismissFalabellaPopup(page);
+
+  await onStep("Falabella login: sesión lista; vuelvo a la URL de destino en Seller Center.");
+  await page.goto(entryUrl, {
+    waitUntil: "domcontentloaded",
+    timeout: 60_000,
+  });
+  await persistFalabellaLocalStorage(page);
 }
 
 
@@ -1040,45 +1178,36 @@ async function openFalabellaDocumentsPage(
   onStep: StepReporter,
 ): Promise<void> {
   await onStep("Abriendo Documentos tributarios en Falabella");
-  await dismissFalabellaSettlementModal(page, onStep);
 
-  const ordersMenu = page.getByRole("link", { name: /Órdenes/i }).first();
-  const documentsOption = page.getByRole("link", { name: /Documentos tributarios/i }).first();
-
-  if (await ordersMenu.isVisible().catch(() => false)) {
-    await ordersMenu.hover().catch(() => undefined);
-    await dismissFalabellaSettlementModal(page, onStep);
-    await documentsOption.waitFor({ state: "visible", timeout: 2_000 }).catch(() => undefined);
-  }
-
-  if (await documentsOption.isVisible().catch(() => false)) {
-    await documentsOption.click({ noWaitAfter: true }).catch(() => undefined);
-    await dismissFalabellaSettlementModal(page, onStep);
-    const readyState = await waitForFalabellaDocumentsReadyState(page, onStep, 15_000);
-    if (readyState === "rows" || readyState === "empty") {
-      return;
-    }
-  } else {
+  if (!isFalabellaDocumentsUrl(page.url())) {
+    await onStep(
+      "Falabella documentos: aún no estoy en Documentos tributarios; navego a la URL configurada (60s).",
+    );
     await page.goto(url, {
       waitUntil: "domcontentloaded",
       timeout: 60_000,
     });
     await persistFalabellaLocalStorage(page);
-    await dismissFalabellaSettlementModal(page, onStep);
-    const readyState = await waitForFalabellaDocumentsReadyState(page, onStep, 15_000);
-    if (readyState === "rows" || readyState === "empty") {
-      return;
-    }
+  } else {
+    await onStep("Falabella documentos: ya cargué la URL de Documentos tributarios tras el login; esperando la tabla.");
   }
 
+  await onStep(
+    "Falabella documentos: esperando tabla de órdenes o lista vacía (hasta 25s).",
+  );
+  let readyState = await waitForFalabellaDocumentsReadyState(page, onStep, 25_000);
+  if (readyState === "rows" || readyState === "empty") {
+    return;
+  }
+
+  await onStep("Falabella documentos: la vista no quedó lista; reintento page.goto a la misma URL (60s).");
   await page.goto(url, {
     waitUntil: "domcontentloaded",
     timeout: 60_000,
   });
   await persistFalabellaLocalStorage(page);
-  await dismissFalabellaSettlementModal(page, onStep);
 
-  const readyState = await waitForFalabellaDocumentsReadyState(page, onStep, 25_000);
+  readyState = await waitForFalabellaDocumentsReadyState(page, onStep, 25_000);
   if (readyState === "timeout") {
     throw new Error("Falabella no mostró la tabla de Documentos tributarios a tiempo.");
   }
@@ -1107,7 +1236,10 @@ async function collectFalabellaPendingRowsAcrossPages(
   let visitedPages = 0;
 
   while (true) {
-    await waitForFalabellaDocumentsRows(page);
+    await waitForFalabellaDocumentsRows(page, 30_000, onStep);
+    await onStep(
+      "Falabella documentos: leyendo controles de paginación (.settlement-invoice-pagination / ul.ant-pagination).",
+    );
     const pagination = await readFalabellaPaginationState(page);
     const pageState = await buildFalabellaPageStateKey(page, pagination.currentPage);
 
@@ -1126,7 +1258,7 @@ async function collectFalabellaPendingRowsAcrossPages(
           : "Documentos tributarios: revisando la única página disponible.",
     );
 
-    const pageCandidates = await collectFalabellaPendingRowsFromCurrentPage(page);
+    const pageCandidates = await collectFalabellaPendingRowsFromCurrentPage(page, onStep);
     for (const candidate of pageCandidates) {
       if (!collected.has(candidate.externalId)) {
         collected.set(candidate.externalId, candidate);
@@ -1142,7 +1274,7 @@ async function collectFalabellaPendingRowsAcrossPages(
         ? `Documentos tributarios: avanzando a la página ${pagination.nextPage}.`
         : "Documentos tributarios: avanzando a la siguiente página.",
     );
-    await goToNextFalabellaDocumentsPage(page, pagination.currentPage, pageState);
+    await goToNextFalabellaDocumentsPage(page, pagination.currentPage, pageState, onStep);
   }
 
   await onStep(
@@ -1166,7 +1298,7 @@ async function findFalabellaPendingRowByOrderIdAcrossPages(
   const visitedPageStates = new Set<string>();
 
   while (true) {
-    await waitForFalabellaDocumentsRows(page);
+    await waitForFalabellaDocumentsRows(page, 30_000, onStep);
     const pagination = await readFalabellaPaginationState(page);
     const pageState = await buildFalabellaPageStateKey(page, pagination.currentPage);
 
@@ -1190,11 +1322,14 @@ async function findFalabellaPendingRowByOrderIdAcrossPages(
       return undefined;
     }
 
-    await goToNextFalabellaDocumentsPage(page, pagination.currentPage, pageState);
+    await goToNextFalabellaDocumentsPage(page, pagination.currentPage, pageState, onStep);
   }
 }
 
-async function collectFalabellaPendingRowsFromCurrentPage(page: Page): Promise<FalabellaRowCandidate[]> {
+async function collectFalabellaPendingRowsFromCurrentPage(
+  page: Page,
+  onStep?: StepReporter,
+): Promise<FalabellaRowCandidate[]> {
   const rows = page.locator("tbody tr[data-row-key]");
   if (!(await rows.first().isVisible().catch(() => false))) {
     return [];
@@ -1206,14 +1341,26 @@ async function collectFalabellaPendingRowsFromCurrentPage(page: Page): Promise<F
     const row = rows.nth(index);
     const externalId = await readFalabellaRowOrderId(row);
     if (!externalId) {
+      await onStep?.(
+        `Falabella documentos: fila ${index + 1}/${count}: no leí N° de orden en el enlace, omito.`,
+      );
       continue;
     }
 
     const candidate = await extractEnabledFalabellaRow(row, externalId);
     if (candidate) {
       candidates.push(candidate);
+      continue;
     }
+
+    await onStep?.(
+      `Falabella documentos: orden ${externalId}: ${await explainFalabellaRowNotPending(row)}`,
+    );
   }
+
+  await onStep?.(
+    `Falabella documentos: en esta bandeja leí ${count} fila(s); ${candidates.length} entraron como pendiente de carga (el resto se excluyó por el motivo de cada log anterior).`,
+  );
 
   return candidates;
 }
@@ -1243,64 +1390,119 @@ async function readFalabellaRowOrderId(row: Locator): Promise<string> {
 }
 
 async function waitForFalabellaPostLogin(page: Page, timeoutMs = 20_000): Promise<void> {
-  const omitButton = page.getByRole("button", { name: /Omitir/i }).first();
   const ordersMenu = page.getByRole("link", { name: /Órdenes/i }).first();
   const documentsOption = page.getByRole("link", { name: /Documentos tributarios/i }).first();
 
   await Promise.race([
-    omitButton.waitFor({ state: "visible", timeout: timeoutMs }).catch(() => undefined),
     ordersMenu.waitFor({ state: "visible", timeout: timeoutMs }).catch(() => undefined),
     documentsOption.waitFor({ state: "visible", timeout: timeoutMs }).catch(() => undefined),
-    page.waitForLoadState("domcontentloaded").catch(() => undefined),
   ]);
 }
 
-async function dismissFalabellaPopup(page: Page): Promise<void> {
-  const omitButton = page.getByRole("button", { name: /Omitir/i }).first();
-
-  if (await omitButton.isVisible().catch(() => false)) {
-    await omitButton.click({ noWaitAfter: true }).catch(() => undefined);
-  }
-}
-
-async function dismissFalabellaSettlementModal(page: Page, onStep?: StepReporter): Promise<void> {
-  const modalRoot = page
-    .locator(".settlement-invoice-app")
-    .filter({ has: page.locator(".ant-modal-content, .modal-content, [role='dialog']") })
+async function dismissFalabellaDocumentUploadFeedbackModal(page: Page, onStep?: StepReporter): Promise<void> {
+  const feedbackWrap = page
+    .locator(".ant-modal-wrap")
+    .filter({ hasText: new RegExp(FALABELLA_DOCUMENT_UPLOAD_FEEDBACK_MARKER, "i") })
     .first();
 
-  if (!(await modalRoot.isVisible().catch(() => false))) {
+  if (!(await feedbackWrap.isVisible().catch(() => false))) {
     return;
   }
 
-  const closeCandidates = [
-    modalRoot.locator(".ant-modal-close, .ant-modal-close-x").first(),
-    modalRoot.getByRole("button", { name: /cancelar|cerrar|close|x/i }).first(),
-    modalRoot.locator("button[aria-label*='close' i], button[title*='close' i]").first(),
-    modalRoot.locator(".modal-header button, .close").first(),
-  ];
+  await onStep?.(
+    "Falabella: encontré el modal de feedback sobre la experiencia de carga de documentos tributarios.",
+  );
 
-  for (const candidate of closeCandidates) {
-    if (await candidate.isVisible().catch(() => false)) {
-      await onStep?.("Falabella mostró un modal de liquidación; lo cierro para continuar.");
-      await candidate.click({ noWaitAfter: true }).catch(() => undefined);
-      await page.waitForTimeout(250);
-      return;
-    }
+  const cancel = feedbackWrap.getByRole("button", { name: /^cancelar$/i }).first();
+  if (await cancel.isVisible().catch(() => false)) {
+    await cancel.click({ noWaitAfter: true }).catch(() => undefined);
+    await page.waitForTimeout(250);
+    await onStep?.("Falabella: modal de feedback de documentos tributarios cerrado (Cancelar).");
+    return;
   }
+
+  const closeBtn = feedbackWrap.locator(".ant-modal-close, .ant-modal-close-x").first();
+  if (await closeBtn.isVisible().catch(() => false)) {
+    await closeBtn.click({ noWaitAfter: true }).catch(() => undefined);
+    await page.waitForTimeout(250);
+    await onStep?.("Falabella: modal de feedback de documentos tributarios cerrado (icono X).");
+    return;
+  }
+
+  await onStep?.(
+    "Falabella: el modal de feedback sigue visible; no encontré Cancelar ni la X para cerrarlo desde Playwright.",
+  );
 }
 
-async function waitForFalabellaDocumentsRows(page: Page, timeoutMs = 30_000): Promise<boolean> {
+async function waitForFalabellaDocumentsRows(
+  page: Page,
+  timeoutMs = 30_000,
+  onStep?: StepReporter,
+): Promise<boolean> {
   await page.waitForLoadState("domcontentloaded").catch(() => undefined);
-  return page
-    .locator("tbody tr[data-row-key]")
-    .first()
-    .waitFor({ state: "visible", timeout: timeoutMs })
-    .then(() => true)
-    .catch(() => false);
+  const rowLocator = page.locator("tbody tr[data-row-key]").first();
+  const logProgress = Boolean(onStep) && timeoutMs >= 2_000;
+
+  if (logProgress) {
+    await onStep?.(
+      `Falabella documentos: buscando filas en la tabla (selector tbody tr[data-row-key]); espera hasta ${Math.round(timeoutMs / 1000)}s.`,
+    );
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  const started = Date.now();
+  let nextLogAt = started + 3_000;
+
+  while (Date.now() < deadline) {
+    if (await rowLocator.isVisible().catch(() => false)) {
+      if (logProgress) {
+        await onStep?.("Falabella documentos: filas de la tabla visibles.");
+      }
+      return true;
+    }
+
+    if (logProgress && Date.now() >= nextLogAt) {
+      const elapsedSec = Math.round((Date.now() - started) / 1000);
+      await onStep?.(
+        `Falabella documentos: sigo buscando filas en la tabla… ${elapsedSec}s / ~${Math.round(timeoutMs / 1000)}s.`,
+      );
+      nextLogAt = Date.now() + 3_000;
+    }
+
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      break;
+    }
+    await page.waitForTimeout(Math.min(250, remaining));
+  }
+
+  if (logProgress) {
+    await onStep?.("Falabella documentos: no aparecieron filas en la tabla dentro del tiempo indicado.");
+  }
+  return false;
 }
 
 type FalabellaDocumentsReadyState = "rows" | "empty" | "timeout";
+
+/** Escribe en log cuántas páginas hay (Ant Pagination) si la barra ya es visible. */
+async function logFalabellaDocumentsPaginationInfo(
+  page: Page,
+  onStep: StepReporter,
+  context: string,
+): Promise<void> {
+  const root = await findFalabellaDocumentsPaginationRoot(page);
+  if (!root) {
+    await onStep(
+      `Falabella documentos (${context}): aún no veo la barra de paginación (.settlement-invoice-pagination o ul.ant-pagination); no puedo contar páginas.`,
+    );
+    return;
+  }
+
+  const p = await readFalabellaPaginationState(page);
+  await onStep(
+    `Falabella documentos (${context}): ${p.totalPages} página(s) en total; página actual ${p.currentPage}.${p.hasNextPage ? ` Hay siguiente (pág. ${p.nextPage ?? p.currentPage + 1}).` : " Siguiente deshabilitado o única página."}`,
+  );
+}
 
 async function waitForFalabellaDocumentsReadyState(
   page: Page,
@@ -1308,27 +1510,51 @@ async function waitForFalabellaDocumentsReadyState(
   timeoutMs = 30_000,
 ): Promise<FalabellaDocumentsReadyState> {
   const deadline = Date.now() + timeoutMs;
-  let nextProgressLogAt = Date.now() + 5_000;
+  const started = Date.now();
+  let nextProgressLogAt = started + 3_000;
+
+  await onStep?.(
+    `Falabella documentos: vigilando vista de documentos (filas tbody tr[data-row-key] o placeholders ant-empty/ant-table-placeholder; hasta ${Math.round(timeoutMs / 1000)}s).`,
+  );
+
+  if (onStep) {
+    await logFalabellaDocumentsPaginationInfo(page, onStep, "tras comenzar la espera");
+  }
 
   while (Date.now() < deadline) {
-    await dismissFalabellaSettlementModal(page, onStep);
-
     if (await waitForFalabellaDocumentsRows(page, 750)) {
+      if (onStep) {
+        await logFalabellaDocumentsPaginationInfo(page, onStep, "tabla con filas visibles");
+      }
+      await onStep?.("Falabella documentos: detecté filas en la tabla; la bandeja tiene datos.");
       return "rows";
     }
 
     if (await hasFalabellaDocumentsEmptyState(page)) {
+      if (onStep) {
+        await logFalabellaDocumentsPaginationInfo(page, onStep, "estado vacío detectado");
+      }
+      await onStep?.(
+        "Falabella documentos: detecté estado de lista vacía (placeholder / ant-empty con texto esperado).",
+      );
       return "empty";
     }
 
-    if (Date.now() >= nextProgressLogAt) {
-      await onStep?.("Documentos tributarios: esperando que Falabella termine de cargar la bandeja.");
-      nextProgressLogAt = Date.now() + 5_000;
+    if (onStep && Date.now() >= nextProgressLogAt) {
+      const elapsedSec = Math.round((Date.now() - started) / 1000);
+      await onStep(
+        `Falabella documentos: aún sin filas ni vacío reconocido; reintento lectura de DOM (${elapsedSec}s / ~${Math.round(timeoutMs / 1000)}s).`,
+      );
+      await logFalabellaDocumentsPaginationInfo(page, onStep, "seguimiento");
+      nextProgressLogAt = Date.now() + 3_000;
     }
 
     await page.waitForTimeout(350);
   }
 
+  await onStep?.(
+    `Falabella documentos: tiempo agotado (${Math.round(timeoutMs / 1000)}s) sin filas ni estado vacío claro.`,
+  );
   return "timeout";
 }
 
@@ -1363,10 +1589,21 @@ async function ensureFalabellaDocumentsStartFromFirstPage(
   page: Page,
   onStep?: StepReporter,
 ): Promise<void> {
-  await waitForFalabellaDocumentsRows(page);
+  await onStep?.(
+    "Falabella documentos: asegurando que la paginación empiece en página 1; primero espero filas visibles.",
+  );
+  await waitForFalabellaDocumentsRows(page, 30_000, onStep);
+  await onStep?.(
+    "Falabella documentos: buscando barra de paginación (ul.ant-pagination / .settlement-invoice-pagination). Si no hay, asumo una sola página (sin escanear todo el sitio).",
+  );
   let pagination = await readFalabellaPaginationState(page);
 
+  await onStep?.(
+    `Falabella documentos: paginación interpretada — página ${pagination.currentPage} de ${pagination.totalPages}${pagination.hasNextPage ? `; hay página siguiente (${pagination.nextPage ?? "?"}).` : "; sin página siguiente."}`,
+  );
+
   if (pagination.currentPage <= 1) {
+    await onStep?.("Falabella documentos: ya estoy en página 1; no muevo paginación.");
     return;
   }
 
@@ -1374,17 +1611,21 @@ async function ensureFalabellaDocumentsStartFromFirstPage(
     `Documentos tributarios: empezaré desde la página 1 para recopilar toda la información (ahora estoy en la ${pagination.currentPage}).`,
   );
 
+  await onStep?.("Falabella documentos: buscando control numérico de página 1 en la paginación.");
   const firstPageControl = await findFalabellaPaginationPageControl(page, 1);
   if (firstPageControl) {
     const previousState = await buildFalabellaPageStateKey(page, pagination.currentPage);
     await firstPageControl.scrollIntoViewIfNeeded().catch(() => undefined);
     await firstPageControl.click({ noWaitAfter: true }).catch(() => undefined);
-    await waitForFalabellaDocumentsPageChange(page, pagination.currentPage, previousState);
+    await waitForFalabellaDocumentsPageChange(page, pagination.currentPage, previousState, onStep);
     await onStep?.("Documentos tributarios: ya estoy en la página 1.");
     return;
   }
 
   while (pagination.currentPage > 1) {
+    await onStep?.(
+      "Falabella documentos: buscando botón «página anterior» (li.ant-pagination-prev / aria-label previous).",
+    );
     const previousControl = await findFalabellaPreviousPaginationControl(page);
 
     if (!previousControl) {
@@ -1396,7 +1637,7 @@ async function ensureFalabellaDocumentsStartFromFirstPage(
     const previousState = await buildFalabellaPageStateKey(page, pagination.currentPage);
     await previousControl.scrollIntoViewIfNeeded().catch(() => undefined);
     await previousControl.click({ noWaitAfter: true }).catch(() => undefined);
-    await waitForFalabellaDocumentsPageChange(page, pagination.currentPage, previousState);
+    await waitForFalabellaDocumentsPageChange(page, pagination.currentPage, previousState, onStep);
     pagination = await readFalabellaPaginationState(page);
   }
 
@@ -1415,18 +1656,18 @@ async function buildFalabellaPageStateKey(page: Page, currentPage: number): Prom
 
 async function readFalabellaPaginationState(page: Page): Promise<FalabellaPaginationState> {
   const paginationRoot = await findFalabellaDocumentsPaginationRoot(page);
-  const scope = paginationRoot ?? page;
-  const pageLabels = Array.from(
-    new Set(
-      (await scope
-        .locator("li.ant-pagination-item, button, [role='button'], a, span")
-        .allTextContents()
-        .catch(() => []))
-        .map((label) => label.replace(/\s+/g, " ").trim())
-        .map((label) => Number(label))
-        .filter((value) => Number.isFinite(value) && value > 0),
-    ),
-  );
+
+  if (!paginationRoot) {
+    return {
+      currentPage: 1,
+      totalPages: 1,
+      hasNextPage: false,
+      nextPage: undefined,
+    };
+  }
+
+  const scope = paginationRoot;
+  const pageLabels = await collectFalabellaPaginationPageNumbers(scope);
   const currentLabel = await readFalabellaCurrentPaginationLabel(scope);
   const currentPage = Number(currentLabel) || 1;
   const inferredTotalFromLabels = pageLabels.length ? Math.max(...pageLabels) : currentPage;
@@ -1443,8 +1684,25 @@ async function readFalabellaPaginationState(page: Page): Promise<FalabellaPagina
   };
 }
 
+async function collectFalabellaPaginationPageNumbers(scope: Page | Locator): Promise<number[]> {
+  const items = scope.locator("li.settlement-invoice-pagination-item, li.ant-pagination-item");
+  const n = await items.count().catch(() => 0);
+  const numbers: number[] = [];
+
+  for (let i = 0; i < n; i += 1) {
+    const raw = ((await items.nth(i).textContent().catch(() => "")) ?? "").replace(/\s+/g, " ").trim();
+    const value = Number(raw.match(/\d+/)?.[0]);
+    if (Number.isFinite(value) && value > 0) {
+      numbers.push(value);
+    }
+  }
+
+  return Array.from(new Set(numbers));
+}
+
 async function readFalabellaCurrentPaginationLabel(scope: Page | Locator): Promise<string> {
   const selectors = [
+    "li.settlement-invoice-pagination-item-active",
     "li.ant-pagination-item-active",
     "[aria-current='page']",
     ".active",
@@ -1467,7 +1725,14 @@ async function readFalabellaCurrentPaginationLabel(scope: Page | Locator): Promi
 }
 
 async function readFalabellaTotalPagesHint(scope: Page | Locator): Promise<number | undefined> {
-  const texts = (await scope.locator(".ant-pagination, .pagination, li, span, div").allTextContents().catch(() => []))
+  const texts = (
+    await scope
+      .locator(
+        ".ant-pagination-options, .ant-pagination-total-text, .ant-pagination-jump, .settlement-invoice-pagination-total-text, li.settlement-invoice-pagination-item, li.ant-pagination-item",
+      )
+      .allTextContents()
+      .catch(() => [])
+  )
     .map((value) => value.replace(/\s+/g, " ").trim())
     .filter(Boolean)
     .slice(0, 40);
@@ -1479,6 +1744,10 @@ async function readFalabellaTotalPagesHint(scope: Page | Locator): Promise<numbe
       if (Number.isFinite(total) && total > 0) {
         return total;
       }
+    }
+
+    if (/\bart[ií]culos\b/i.test(text) || /\bitems\b/i.test(text)) {
+      continue;
     }
 
     const spanish = text.match(/\b(?:de|total)\s*(\d+)\b/i);
@@ -1494,22 +1763,52 @@ async function readFalabellaTotalPagesHint(scope: Page | Locator): Promise<numbe
 }
 
 async function isFalabellaPaginationControlDisabled(control: Locator): Promise<boolean> {
-  return (
-    (await control.isDisabled().catch(() => false))
-    || (await control.getAttribute("disabled").catch(() => null)) !== null
-    || (await control.getAttribute("aria-disabled").catch(() => null)) === "true"
-    || (await control
-      .evaluate((element) =>
-        element.classList.contains("disabled") || element.classList.contains("ant-pagination-disabled"))
-      .catch(() => false))
-  );
+  const fromDom = await control
+    .evaluate((element: HTMLElement) => {
+      const li = element.closest("li");
+      if (li?.classList.contains("settlement-invoice-pagination-disabled")) {
+        return true;
+      }
+      if (li?.getAttribute("aria-disabled") === "true") {
+        return true;
+      }
+      if (element.hasAttribute("disabled")) {
+        return true;
+      }
+      if (
+        element.classList.contains("disabled")
+        || element.classList.contains("ant-pagination-disabled")
+      ) {
+        return true;
+      }
+      return false;
+    })
+    .catch(() => false);
+
+  if (fromDom) {
+    return true;
+  }
+
+  if (await control.isDisabled().catch(() => false)) {
+    return true;
+  }
+
+  if ((await control.getAttribute("disabled").catch(() => null)) !== null) {
+    return true;
+  }
+
+  return (await control.getAttribute("aria-disabled").catch(() => null)) === "true";
 }
 
 async function goToNextFalabellaDocumentsPage(
   page: Page,
   currentPage: number,
   previousState: string,
+  onStep?: StepReporter,
 ): Promise<void> {
+  await onStep?.(
+    "Falabella documentos: buscando control «siguiente página» (li.ant-pagination-next / aria-label next).",
+  );
   const nextControl = await findFalabellaNextPaginationControl(page);
 
   if (!nextControl) {
@@ -1518,7 +1817,7 @@ async function goToNextFalabellaDocumentsPage(
 
   await nextControl.scrollIntoViewIfNeeded().catch(() => undefined);
   await nextControl.click({ noWaitAfter: true }).catch(() => undefined);
-  await waitForFalabellaDocumentsPageChange(page, currentPage, previousState);
+  await waitForFalabellaDocumentsPageChange(page, currentPage, previousState, onStep);
 }
 
 async function findFalabellaPaginationPageControl(
@@ -1528,6 +1827,10 @@ async function findFalabellaPaginationPageControl(
   const paginationRoot = await findFalabellaDocumentsPaginationRoot(page);
   const scope = paginationRoot ?? page;
   const candidates = [
+    scope
+      .locator("li.settlement-invoice-pagination-item")
+      .filter({ hasText: new RegExp(`^\\s*${targetPage}\\s*$`) })
+      .first(),
     scope
       .locator("li.ant-pagination-item")
       .filter({ hasText: new RegExp(`^\\s*${targetPage}\\s*$`) })
@@ -1549,10 +1852,13 @@ async function findFalabellaNextPaginationControl(page: Page): Promise<Locator |
   const paginationRoot = await findFalabellaDocumentsPaginationRoot(page);
   const scope = paginationRoot ?? page;
   const candidates = [
+    scope.locator("li.settlement-invoice-pagination-next button").first(),
+    scope.locator("li.settlement-invoice-pagination-next").first(),
     scope.locator("li.ant-pagination-next button").first(),
     scope.locator("li.ant-pagination-next").first(),
     scope.locator("[aria-label*='next' i]").first(),
     scope.locator("[title*='next' i]").first(),
+    scope.locator("[title*='siguiente' i]").first(),
     scope.getByRole("button", { name: /^\s*>\s*$/ }).first(),
     scope.getByText(/^\s*>\s*$/).first(),
   ];
@@ -1580,9 +1886,24 @@ async function findFalabellaDocumentsPaginationRoot(page: Page): Promise<Locator
       continue;
     }
 
-    const itemCount = await candidate.locator("li.ant-pagination-item").count().catch(() => 0);
-    const hasCurrent = (await candidate.locator("li.ant-pagination-item-active, [aria-current='page']").count().catch(() => 0)) > 0;
-    const hasNext = (await candidate.locator("li.ant-pagination-next, [aria-label*='next' i], [title*='next' i]").count().catch(() => 0)) > 0;
+    const itemCount = await candidate
+      .locator("li.settlement-invoice-pagination-item, li.ant-pagination-item")
+      .count()
+      .catch(() => 0);
+    const hasCurrent =
+      (await candidate
+        .locator(
+          "li.settlement-invoice-pagination-item-active, li.ant-pagination-item-active, [aria-current='page']",
+        )
+        .count()
+        .catch(() => 0)) > 0;
+    const hasNext =
+      (await candidate
+        .locator(
+          "li.settlement-invoice-pagination-next, li.ant-pagination-next, [aria-label*='next' i], [title*='next' i], [title*='siguiente' i]",
+        )
+        .count()
+        .catch(() => 0)) > 0;
     const score = (itemCount * 3) + (hasCurrent ? 4 : 0) + (hasNext ? 2 : 0);
 
     if (!best || score > best.score) {
@@ -1603,7 +1924,12 @@ async function findFalabellaDocumentsPaginationRoot(page: Page): Promise<Locator
       continue;
     }
 
-    const itemCount = await candidate.locator("li.ant-pagination-item, li.ant-pagination-next").count().catch(() => 0);
+    const itemCount = await candidate
+      .locator(
+        "li.settlement-invoice-pagination-item, li.settlement-invoice-pagination-next, li.ant-pagination-item, li.ant-pagination-next",
+      )
+      .count()
+      .catch(() => 0);
     if (itemCount > 0) {
       return candidate;
     }
@@ -1616,10 +1942,13 @@ async function findFalabellaPreviousPaginationControl(page: Page): Promise<Locat
   const paginationRoot = await findFalabellaDocumentsPaginationRoot(page);
   const scope = paginationRoot ?? page;
   const candidates = [
+    scope.locator("li.settlement-invoice-pagination-prev button").first(),
+    scope.locator("li.settlement-invoice-pagination-prev").first(),
     scope.locator("li.ant-pagination-prev button").first(),
     scope.locator("li.ant-pagination-prev").first(),
     scope.locator("[aria-label*='prev' i], [aria-label*='previous' i]").first(),
     scope.locator("[title*='prev' i], [title*='previous' i]").first(),
+    scope.locator("[title*='anterior' i]").first(),
     scope.getByRole("button", { name: /^\s*<\s*$/ }).first(),
     scope.getByText(/^\s*<\s*$/).first(),
   ];
@@ -1640,8 +1969,15 @@ async function waitForFalabellaDocumentsPageChange(
   page: Page,
   previousPage: number,
   previousState: string,
+  onStep?: StepReporter,
 ): Promise<void> {
   const deadline = Date.now() + 30_000;
+  const started = Date.now();
+  let nextLogAt = started + 3_000;
+
+  await onStep?.(
+    `Falabella documentos: esperando cambio de página o de filas (${previousPage} → siguiente; hasta 30s).`,
+  );
 
   while (Date.now() < deadline) {
     await page.waitForTimeout(300);
@@ -1649,12 +1985,89 @@ async function waitForFalabellaDocumentsPageChange(
     const currentState = await buildFalabellaPageStateKey(page, pagination.currentPage);
 
     if (pagination.currentPage !== previousPage || currentState !== previousState) {
-      await waitForFalabellaDocumentsRows(page);
+      await waitForFalabellaDocumentsRows(page, 30_000, onStep);
+      await onStep?.(
+        `Falabella documentos: paginación actualizada (página ${pagination.currentPage}); filas listas.`,
+      );
       return;
+    }
+
+    if (onStep && Date.now() >= nextLogAt) {
+      const elapsedSec = Math.round((Date.now() - started) / 1000);
+      await onStep(
+        `Falabella documentos: aún en página ${previousPage}, esperando re-render tras el click… ${elapsedSec}s.`,
+      );
+      nextLogAt = Date.now() + 3_000;
     }
   }
 
   throw new Error("Falabella no avanzó a la siguiente página de Documentos tributarios.");
+}
+
+/** Busca en celdas de la fila el texto de progreso «subidos de total» (p. ej. 0 de 1); la columna varía. */
+async function readFalabellaRowDocumentProgressRaw(row: Locator): Promise<string> {
+  const cells = row.locator(":scope > td");
+  const n = await cells.count().catch(() => 0);
+
+  for (let i = 0; i < n; i += 1) {
+    const text = ((await cells.nth(i).textContent().catch(() => "")) ?? "").replace(/\s+/g, " ").trim();
+    if (/\d+\s+de\s+\d+/i.test(text)) {
+      return text;
+    }
+  }
+
+  return "";
+}
+
+/** Fecha visible en la fila (celda que parece fecha); evita depender de un índice fijo. */
+async function readFalabellaRowIssuedAtRaw(row: Locator): Promise<string> {
+  const cells = row.locator(":scope > td");
+  const n = await cells.count().catch(() => 0);
+
+  for (let i = 0; i < n; i += 1) {
+    const text = ((await cells.nth(i).textContent().catch(() => "")) ?? "").replace(/\s+/g, " ").trim();
+    if (/\d{1,2}\/\d{1,2}\/\d{4}/.test(text) || /\b\d{4}-\d{1,2}-\d{1,2}\b/.test(text)) {
+      return text;
+    }
+  }
+
+  return ((await row.locator(":scope > td").nth(1).textContent().catch(() => "")) ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function explainFalabellaRowNotPending(row: Locator): Promise<string> {
+  const orderLink = row.locator("a[href*='/order/view/number/']").first();
+  const detailUrl = await orderLink.getAttribute("href", { timeout: 500 }).catch(() => null);
+
+  if (!detailUrl) {
+    return "sin enlace /order/view/number/ en la fila.";
+  }
+
+  const button = row.locator("button.uploadbtn").first();
+  const disabled =
+    (await button.isDisabled().catch(() => false)) ||
+    (await button.getAttribute("disabled").catch(() => null)) !== null;
+
+  if (disabled) {
+    return "botón de carga (uploadbtn) deshabilitado.";
+  }
+
+  const documentProgress = await readFalabellaRowDocumentProgressRaw(row);
+  const counts = parseFalabellaDocumentProgress(documentProgress);
+
+  if (!counts) {
+    const hint = documentProgress
+      ? `texto de celda con «de»: «${documentProgress.slice(0, 100)}${documentProgress.length > 100 ? "…" : ""}»`
+      : "ninguna celda de la fila coincidió con patrón «número de número» (documentos asociados).";
+    return `no pude interpretar progreso de documentos; ${hint}`;
+  }
+
+  if (counts.uploaded >= counts.total) {
+    return `no está pendiente según progreso (${counts.raw}, ya cargados todos).`;
+  }
+
+  return "excluida por validación interna inesperada.";
 }
 
 async function extractEnabledFalabellaRow(
@@ -1673,9 +2086,7 @@ async function extractEnabledFalabellaRow(
     (await button.isDisabled().catch(() => false)) ||
     (await button.getAttribute("disabled").catch(() => null)) !== null;
 
-  const documentProgress = ((await row.locator("td").nth(4).textContent().catch(() => "")) ?? "")
-    .replace(/\s+/g, " ")
-    .trim();
+  const documentProgress = await readFalabellaRowDocumentProgressRaw(row);
   const counts = parseFalabellaDocumentProgress(documentProgress);
 
   if (disabled || !counts || counts.uploaded >= counts.total) {
@@ -1683,16 +2094,11 @@ async function extractEnabledFalabellaRow(
   }
 
   const externalId = (((await orderLink.textContent().catch(() => "")) ?? "").match(/\d+/)?.[0] ?? "").trim();
-  const issuedAt = ((await row.locator("td").nth(2).textContent().catch(() => "")) ?? "")
-    .replace(/\s+/g, " ")
-    .trim();
+  const issuedAt = await readFalabellaRowIssuedAtRaw(row);
 
   if (!externalId || (expectedOrderId && externalId !== expectedOrderId)) {
     return undefined;
   }
-
-  const itemDocumentTypes = await readFalabellaExpandedItemDocumentTypes(row);
-  const requestedDocumentType = summarizeFalabellaDocumentTypeEntries(itemDocumentTypes);
 
   return {
     externalId,
@@ -1701,32 +2107,69 @@ async function extractEnabledFalabellaRow(
     documentProgress: counts.raw,
     uploadedDocuments: counts.uploaded,
     totalDocuments: counts.total,
-    requestedDocumentType,
-    itemDocumentTypes,
+    requestedDocumentType: undefined,
+    itemDocumentTypes: [],
   };
+}
+
+async function waitForFalabellaOrderDetailReady(
+  detailPage: Page,
+  detailUrl: string,
+): Promise<Record<string, string>> {
+  await detailPage.goto(detailUrl, {
+    waitUntil: "domcontentloaded",
+    timeout: 60_000,
+  });
+  await detailPage.getByText(/Informaci[oó]n del cliente/i).first().waitFor({
+    state: "visible",
+    timeout: 30_000,
+  });
+  await detailPage.locator(".card-details .row.my-1").first().waitFor({
+    state: "visible",
+    timeout: 15_000,
+  });
+  await detailPage.waitForTimeout(2_000);
+  return readFalabellaDetailMap(detailPage);
+}
+
+function falabellaDetailIndicatesFactura(detailMap: Record<string, string>): boolean {
+  const raw = (detailMap["documento tributario"] ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+
+  if (!raw) {
+    return false;
+  }
+
+  return /\bfactura\b/.test(raw);
 }
 
 async function readFalabellaSaleFromDetail(
   detailPage: Page,
   row: FalabellaRowCandidate,
   config: AppConfig,
+  options?: { initialDetailMap?: Record<string, string> },
 ): Promise<Sale> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    await detailPage.goto(row.detailUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: 60_000,
-    });
-    await detailPage.getByText(/Informaci[oó]n del cliente/i).first().waitFor({
-      state: "visible",
-      timeout: 30_000,
-    });
-    await detailPage.locator(".card-details .row.my-1").first().waitFor({
-      state: "visible",
-      timeout: 15_000,
-    });
-    await detailPage.waitForTimeout(attempt === 0 ? 2_000 : 4_000);
+    let detailMap: Record<string, string>;
 
-    const detailMap = await readFalabellaDetailMap(detailPage);
+    if (attempt === 0 && options?.initialDetailMap) {
+      detailMap = options.initialDetailMap;
+      await detailPage.waitForTimeout(500);
+    } else {
+      await detailPage.goto(row.detailUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: 60_000,
+      });
+      await detailPage.getByText(/Informaci[oó]n del cliente/i).first().waitFor({
+        state: "visible",
+        timeout: 30_000,
+      });
+      await detailPage.locator(".card-details .row.my-1").first().waitFor({
+        state: "visible",
+        timeout: 15_000,
+      });
+      await detailPage.waitForTimeout(attempt === 0 ? 2_000 : 4_000);
+      detailMap = await readFalabellaDetailMap(detailPage);
+    }
     const total = parseAmount(
       detailMap["gran total"] ?? detailMap["productos incluidos impuestos"] ?? "",
     );
@@ -1739,6 +2182,8 @@ async function readFalabellaSaleFromDetail(
       detailMap["n identificacion"] ??
       detailMap["numero identificacion"] ??
       "";
+    const tributaryDocumentLabel = (detailMap["documento tributario"] ?? "").replace(/\s+/g, " ").trim();
+    const requestedDocumentTypeFromDetail = normalizeFalabellaDocumentType(tributaryDocumentLabel);
 
     if (customerName !== "Cliente sin nombre" && documentNumber && productCount > 0 && computedTotal > 0) {
       const { baseAmount, taxAmount } = splitIgv(computedTotal);
@@ -1768,7 +2213,7 @@ async function readFalabellaSaleFromDetail(
           detailUrl: row.detailUrl,
           dashboardUrl: config.sellerPurchasedOrdersUrl,
           documentProgress: row.documentProgress,
-          requestedDocumentType: row.requestedDocumentType,
+          requestedDocumentType: requestedDocumentTypeFromDetail ?? row.requestedDocumentType,
           productCount,
           uploadedDocuments: row.uploadedDocuments,
           totalDocuments: row.totalDocuments,
@@ -1820,12 +2265,45 @@ async function readFalabellaProductCount(
   detailPage: Page,
   fallbackCount: number,
 ): Promise<number> {
+  const quantityTexts = await detailPage.locator('[role="row"][id^="row-"]').evaluateAll((elements) => {
+    const texts: string[] = [];
+
+    for (const element of elements) {
+      const description =
+        element.querySelector("img[alt]")?.getAttribute("alt")?.trim() ||
+        element.querySelector("p.fw-700")?.textContent?.replace(/\s+/g, " ").trim() ||
+        "";
+
+      if (!description) {
+        continue;
+      }
+
+      const quantityText =
+        element
+          .querySelector('[data-column-id="3"] [data-tag="allowRowEvents"], [data-column-id="3"]')
+          ?.textContent?.replace(/\s+/g, " ")
+          .trim() || "";
+
+      texts.push(quantityText);
+    }
+
+    return texts;
+  });
+
+  const fromCantidadColumn = quantityTexts.reduce(
+    (sum, raw) => sum + Math.max(parseAmount(raw), 1),
+    0,
+  );
+
+  if (fromCantidadColumn > 0) {
+    return fromCantidadColumn;
+  }
+
   if (fallbackCount > 0) {
     return fallbackCount;
   }
 
-  const detailCount = await detailPage.locator('[role="row"][id^="row-"]').count().catch(() => 0);
-  return Math.max(detailCount, 0);
+  return quantityTexts.length;
 }
 
 async function readFalabellaPrimaryProductDescription(
@@ -1935,95 +2413,6 @@ async function readFalabellaItems(
       documentType,
     };
   });
-}
-
-async function readFalabellaExpandedItemDocumentTypes(
-  row: Locator,
-): Promise<Array<{ description: string; documentType?: string }>> {
-  const expandedRow = row.locator("xpath=following-sibling::tr[1]");
-  let toggle: Locator | null = null;
-  let expandedByAutomation = false;
-
-  if (!(await hasFalabellaExpandedDocumentTable(expandedRow))) {
-    toggle = await findFalabellaExpandToggle(row);
-    if (toggle) {
-      await toggle.click().catch(() => undefined);
-      await row.page().waitForTimeout(800);
-      expandedByAutomation = true;
-    }
-  }
-
-  if (!(await hasFalabellaExpandedDocumentTable(expandedRow))) {
-    return [];
-  }
-
-  const entries = await expandedRow.evaluate((element) => {
-    const tables = Array.from(element.querySelectorAll("table"));
-
-    for (const table of tables) {
-      const headers = Array.from(table.querySelectorAll("th")).map((header) =>
-        (header.textContent || "").replace(/\s+/g, " ").trim(),
-      );
-      const productIndex = headers.findIndex((header) => /producto/i.test(header));
-      const documentTypeIndex = headers.findIndex((header) => /tipo documento/i.test(header));
-
-      if (productIndex === -1 || documentTypeIndex === -1) {
-        continue;
-      }
-
-      const rows = Array.from(table.querySelectorAll("tbody tr"));
-      const entries = rows
-        .map((tableRow) =>
-          Array.from(tableRow.querySelectorAll("td")).map((cell) =>
-            (cell.textContent || "").replace(/\s+/g, " ").trim(),
-          ),
-        )
-        .filter((cells) => cells.length > documentTypeIndex)
-        .map((cells) => ({
-          description: cells[productIndex] || "",
-          documentType: cells[documentTypeIndex] || undefined,
-        }))
-        .filter((entry) => entry.description);
-
-      if (entries.length) {
-        return entries;
-      }
-    }
-
-    return [];
-  });
-
-  if (expandedByAutomation) {
-    const collapseToggle = toggle ?? (await findFalabellaExpandToggle(row));
-    if (collapseToggle) {
-      await collapseToggle.click().catch(() => undefined);
-      await row.page().waitForTimeout(400);
-    }
-  }
-
-  return entries;
-}
-
-async function hasFalabellaExpandedDocumentTable(expandedRow: Locator): Promise<boolean> {
-  const typeHeader = expandedRow.getByText(/Tipo Documento/i).first();
-  return typeHeader.isVisible().catch(() => false);
-}
-
-async function findFalabellaExpandToggle(row: Locator): Promise<Locator | null> {
-  const candidates = [
-    row.locator(".ant-table-row-expand-icon").first(),
-    row.locator("td").first().locator("button").first(),
-    row.locator("td").first().locator("[role='button']").first(),
-    row.locator("td").first(),
-  ];
-
-  for (const candidate of candidates) {
-    if (await candidate.isVisible().catch(() => false)) {
-      return candidate;
-    }
-  }
-
-  return null;
 }
 
 function parseFalabellaDocumentProgress(raw: string): { uploaded: number; total: number; raw: string } | undefined {
@@ -2192,6 +2581,14 @@ function monthTokenToNumber(token: string): string {
 
 function roundCurrency(value: number): number {
   return Math.round(value * 100) / 100;
+}
+
+/** Decimales al escribir importes/precio unitario en SUNAT (evita que el total se dispare por redondeo). */
+const SUNAT_CURRENCY_DECIMALS = 6;
+
+function roundSunatAmount(value: number): number {
+  const factor = 10 ** SUNAT_CURRENCY_DECIMALS;
+  return Math.round((value + Number.EPSILON) * factor) / factor;
 }
 
 export function splitIgv(total: number): { baseAmount: number; taxAmount: number } {
@@ -3618,8 +4015,8 @@ function buildSunatItemCode(description: string, index: number): string {
   return normalized ? `${normalized}${index + 1}` : `ITEM${index + 1}`;
 }
 
-function formatSunatCurrency(value: number): string {
-  return value.toFixed(2);
+export function formatSunatCurrency(value: number): string {
+  return roundSunatAmount(value).toFixed(SUNAT_CURRENCY_DECIMALS);
 }
 
 function sanitizeSunatItemDescription(description: string): string {
@@ -3634,15 +4031,18 @@ function sanitizeSunatItemDescription(description: string): string {
   return sanitized.slice(0, 60).trim();
 }
 
-function calculateSunatUnitPrice(item: InvoiceDraft["items"][number], draft: InvoiceDraft): number {
+export function calculateSunatUnitPrice(
+  item: InvoiceDraft["items"][number],
+  draft: InvoiceDraft,
+): number {
   const quantity = Math.max(item.quantity, 1);
   const grossUnitPrice = item.total > 0 ? item.total / quantity : item.unitPrice;
 
   if (draft.totals.tax <= 0) {
-    return roundCurrency(grossUnitPrice);
+    return roundSunatAmount(grossUnitPrice);
   }
 
-  return roundCurrency(grossUnitPrice / 1.18);
+  return roundSunatAmount(grossUnitPrice / 1.18);
 }
 
 async function ensureCustomerDocumentType(locator: Locator, documentNumber: string): Promise<void> {

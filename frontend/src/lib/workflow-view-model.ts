@@ -190,8 +190,10 @@ function buildExtractionSummaryJson(run: DashboardRunRecord): string {
       "orderNumber",
       "dni",
       "customerName",
-      "items[].productName",
-      "items[].unitPrice",
+      "products[].description",
+      "products[].quantity",
+      "products[].unitPrice",
+      "products[].total",
       "total",
     ],
   };

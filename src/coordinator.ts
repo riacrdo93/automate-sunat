@@ -918,7 +918,7 @@ export class AutomationCoordinator {
       return { stageId: "detectar_ventas", stepId: "abrir_falabella" };
     }
 
-    if (/Documentos tributarios/i.test(step)) {
+    if (/Abriendo Documentos tributarios en Falabella/i.test(step)) {
       return { stageId: "detectar_ventas", stepId: "filtrar_ventas_pendientes" };
     }
 
@@ -959,6 +959,13 @@ export class AutomationCoordinator {
         typeof sale.raw.productCount === "number"
           ? sale.raw.productCount
           : sale.items.reduce((sum, item) => sum + item.quantity, 0),
+      products: sale.items.map((item) => ({
+        description: item.description,
+        quantity: item.quantity,
+        unitPrice: item.unitPrice,
+        total: item.total,
+        ...(item.documentType ? { documentType: item.documentType } : {}),
+      })),
     }));
 
     const content = JSON.stringify(payload, null, 2);

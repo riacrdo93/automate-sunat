@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   CheckCircle2,
   Circle,
@@ -139,8 +139,8 @@ function LogConsole({
   };
 
   return (
-    <div className="overflow-hidden rounded-md border border-border/30 bg-[#0a0a0a] font-mono text-[10px]">
-      <div ref={scrollRef} className={cn("overflow-y-auto", maxHeightClass)}>
+    <div className="overflow-hidden rounded-md border border-border/30 bg-[#0a0a0a] font-mono text-[11px] leading-snug">
+      <div ref={scrollRef} className={cn("overflow-y-auto overflow-x-hidden", maxHeightClass)}>
         {logs.map((log, index) => (
           <div key={index} className="flex items-start gap-2 border-b border-border/5 px-2 py-1 last:border-b-0">
             <span className="shrink-0 text-muted-foreground/30">{log.timestamp}</span>
@@ -157,8 +157,7 @@ function LogConsole({
 
 function LiveActivityPanel({ step }: { step: WorkflowStepView }) {
   const liveSubStep = step.subSteps.find((subStep) => subStep.status === "running");
-  const recentLogs = useMemo(() => step.logs.slice(-6), [step.logs]);
-  const latestLog = recentLogs[recentLogs.length - 1];
+  const latestLog = step.logs[step.logs.length - 1];
   const currentMessage =
     liveSubStep?.detail ?? latestLog?.message ?? "Esperando el siguiente evento de esta etapa.";
   const currentLabel = liveSubStep ? "Accion actual" : latestLog ? "Ultimo evento" : "Estado";
@@ -198,22 +197,11 @@ function LiveActivityPanel({ step }: { step: WorkflowStepView }) {
               {liveSubStep?.name ? (
                 <p className="text-[11px] leading-5 text-muted-foreground">{liveSubStep.name}</p>
               ) : null}
+              <p className="mt-2 text-[10px] text-muted-foreground">
+                El listado completo está en el tab <span className="font-medium text-foreground/80">Logs</span> ({step.logs.length})
+              </p>
             </div>
           </div>
-        </div>
-
-        <div>
-          <div className="mb-1 flex items-center justify-between gap-2 px-0.5">
-            <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-              Ultimos eventos
-            </p>
-            <span className="text-[10px] text-muted-foreground">{step.logs.length} total</span>
-          </div>
-          <LogConsole
-            logs={recentLogs}
-            maxHeightClass="max-h-40"
-            emptyMessage="Esperando los primeros eventos de esta etapa"
-          />
         </div>
       </div>
     </div>
@@ -221,7 +209,21 @@ function LiveActivityPanel({ step }: { step: WorkflowStepView }) {
 }
 
 function LogsList({ logs }: { logs: WorkflowLogView[] }) {
-  return <LogConsole logs={logs} />;
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-2 px-0.5">
+        <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+          Registro de eventos
+        </p>
+        <span className="text-[10px] text-muted-foreground">{logs.length} total</span>
+      </div>
+      <LogConsole
+        logs={logs}
+        maxHeightClass="max-h-[min(70vh,640px)] min-h-[240px]"
+        emptyMessage="Esperando los primeros eventos de esta etapa"
+      />
+    </div>
+  );
 }
 
 function OutputsList({ outputs }: { outputs: WorkflowOutputView[] }) {
@@ -255,7 +257,7 @@ function OutputsList({ outputs }: { outputs: WorkflowOutputView[] }) {
 }
 
 export function StepDetails({ step, stepNumber, action, onAction }: StepDetailsProps) {
-  const [activeTab, setActiveTab] = useState("substeps");
+  const [activeTab, setActiveTab] = useState("logs");
 
   const completedSubSteps = step.subSteps.filter((s) => s.status === "completed").length;
   const totalSubSteps = step.subSteps.length;
