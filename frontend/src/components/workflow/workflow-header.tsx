@@ -10,6 +10,8 @@ interface WorkflowHeaderProps {
   totalDuration: string;
   completedSteps: number;
   totalSteps: number;
+  startLabel?: string;
+  runningLabel?: string;
   onStartRun?: () => void;
   onStopRun?: () => void;
   isRunning?: boolean;
@@ -23,6 +25,8 @@ export function WorkflowHeader({
   totalDuration,
   completedSteps,
   totalSteps,
+  startLabel = "Ejecutar workflow",
+  runningLabel = "Workflow en curso",
   onStartRun,
   onStopRun,
   isRunning = false,
@@ -124,7 +128,7 @@ export function WorkflowHeader({
             </Button>
             <Button size="sm" className="gap-2" onClick={onStartRun} disabled={isRunning}>
               {isRunning ? <Loader2 className="size-3.5 animate-spin" /> : <Play className="size-3.5" />}
-              <span className="hidden sm:inline">{isRunning ? "Workflow en curso" : "Lanzar workflow"}</span>
+              <span className="hidden sm:inline">{isRunning ? runningLabel : startLabel}</span>
             </Button>
           </div>
         </div>

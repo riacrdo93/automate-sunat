@@ -7,6 +7,7 @@ import {
   customerDocumentSelectors,
   customerNameSelectors,
   extractSunatReceiptPrefix,
+  falabellaDocumentsTextLooksEmpty,
   splitIgv,
 } from "../src/browser";
 
@@ -55,6 +56,14 @@ describe("browser helpers", () => {
 
   test("extracts the SUNAT receipt prefix from the emitted number", () => {
     expect(extractSunatReceiptPrefix("EB01-598")).toBe("EB01");
+  });
+
+  test("detects Falabella empty states instead of waiting forever for rows", () => {
+    expect(falabellaDocumentsTextLooksEmpty("No hay datos")).toBe(true);
+    expect(falabellaDocumentsTextLooksEmpty("Sin resultados para los filtros aplicados")).toBe(true);
+    expect(falabellaDocumentsTextLooksEmpty("No data")).toBe(true);
+    expect(falabellaDocumentsTextLooksEmpty("3229988096")).toBe(false);
+    expect(falabellaDocumentsTextLooksEmpty("Documento pendiente 1 de 2")).toBe(false);
   });
 
   test("uses the exact SUNAT ids for the final emit flow in the active profiles", () => {

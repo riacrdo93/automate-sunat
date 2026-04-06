@@ -4,8 +4,17 @@ import { describe, expect, it, vi } from "vitest";
 import { DashboardWorkspace } from "./app";
 import { createSnapshot } from "./test/fixtures";
 
-function WorkspaceHarness({ isRunning = true }: { isRunning?: boolean }) {
+function WorkspaceHarness({
+  isRunning = true,
+  autoContinueStepTwo = false,
+}: {
+  isRunning?: boolean;
+  autoContinueStepTwo?: boolean;
+}) {
   const snapshot = createSnapshot({
+    config: {
+      autoContinueStepTwo,
+    },
     runtime: {
       isRunning,
       currentRunId: isRunning ? "run-live" : undefined,
@@ -16,7 +25,7 @@ function WorkspaceHarness({ isRunning = true }: { isRunning?: boolean }) {
       stepTwoReady: {
         available: true,
         pendingSales: 1,
-        message: "1 venta(s) guardada(s) del paso 1 listas para ejecutar solo el paso 2.",
+        message: "1 venta(s) guardada(s) del paso 1 listas para continuar con el paso 2.",
       },
     },
   });
@@ -54,7 +63,7 @@ describe("DashboardWorkspace", () => {
 
     const historySidebar = screen.getByText("Workflows").closest("aside");
 
-    expect(screen.getByRole("button", { name: "Workflow en curso" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Paso 1 en curso" })).toBeInTheDocument();
     expect(screen.getByText("Workflows")).toBeInTheDocument();
     expect(screen.getByText("Navega los workflows y abre cualquier ejecución anterior.")).toBeInTheDocument();
     expect(historySidebar).not.toBeNull();
@@ -74,7 +83,7 @@ describe("DashboardWorkspace", () => {
   it("shows the launch action and latest run when there is no active run", () => {
     render(<WorkspaceHarness isRunning={false} />);
 
-    expect(screen.getByRole("button", { name: "Lanzar workflow" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Ejecutar paso 1" })).toBeInTheDocument();
     expect(screen.getByText("Seller a SUNAT")).toBeInTheDocument();
     expect(screen.getAllByText("Obtencion de informacion de ventas").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Registro de boleta electrónica").length).toBeGreaterThan(0);
@@ -85,8 +94,15 @@ describe("DashboardWorkspace", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /Registro de boleta electrónica/i }));
 
-    expect(screen.getByRole("button", { name: "Ejecutar solo paso 2" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Continuar con paso 2" })).toBeInTheDocument();
     expect(screen.getByText(/venta\(s\) guardada\(s\) del paso 1/i)).toBeInTheDocument();
+  });
+
+  it("switches the main CTA when step 2 is automatic by config", () => {
+    render(<WorkspaceHarness isRunning={false} autoContinueStepTwo />);
+
+    expect(screen.getByRole("button", { name: "Ejecutar workflow" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Continuar con paso 2" })).not.toBeInTheDocument();
   });
 
   it("lets you switch the focused run from the automation history sidebar", () => {
@@ -141,7 +157,7 @@ describe("DashboardWorkspace", () => {
               stepTwoReady: {
                 available: false,
                 pendingSales: 0,
-                message: "No hay ventas guardadas del paso 1 listas para ejecutar solo el paso 2.",
+                message: "No hay ventas guardadas del paso 1 listas para continuar con el paso 2.",
               },
             },
           })
@@ -167,7 +183,7 @@ describe("DashboardWorkspace", () => {
     );
 
     expect(screen.getByText("Seller a SUNAT")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Lanzar workflow" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Ejecutar paso 1" })).toBeInTheDocument();
     expect(screen.getByText("No hay workflows todavía")).toBeInTheDocument();
     expect(screen.getByText("Workflows")).toBeInTheDocument();
   });
@@ -190,7 +206,7 @@ describe("DashboardWorkspace", () => {
               stepTwoReady: {
                 available: true,
                 pendingSales: 1,
-                message: "1 venta(s) guardada(s) del paso 1 listas para ejecutar solo el paso 2.",
+                message: "1 venta(s) guardada(s) del paso 1 listas para continuar con el paso 2.",
               },
             },
           })

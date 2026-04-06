@@ -39,8 +39,11 @@ SUNAT_USERNAME=tu-usuario-sol
 SUNAT_PASSWORD=tu-clave-sol
 HEADFUL=true
 RUN_MODE=manual
+AUTO_CONTINUE_STEP_2=false
 CHECK_INTERVAL_MINUTES=60
 ```
+
+Con `AUTO_CONTINUE_STEP_2=false`, la corrida manual se queda en el paso 1 y luego puedes continuar el paso 2 desde el panel. Si lo cambias a `true`, la corrida manual sigue automáticamente hasta SUNAT.
 
 ## Comandos útiles
 

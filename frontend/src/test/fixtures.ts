@@ -182,6 +182,7 @@ const baseSnapshot: DashboardSnapshot = {
   config: {
     profile: "custom",
     runMode: "manual",
+    autoContinueStepTwo: false,
     checkIntervalMinutes: 30,
     headful: false,
     baseUrl: "http://localhost:3030",
@@ -199,7 +200,7 @@ const baseSnapshot: DashboardSnapshot = {
     stepTwoReady: {
       available: true,
       pendingSales: 1,
-      message: "1 venta(s) guardada(s) del paso 1 listas para ejecutar solo el paso 2.",
+      message: "1 venta(s) guardada(s) del paso 1 listas para continuar con el paso 2.",
     },
   },
   sales: [
@@ -227,9 +228,12 @@ const baseSnapshot: DashboardSnapshot = {
   runs: [activeRun, historicalRun],
 };
 
-type SnapshotOverrides = Partial<DashboardSnapshot> & {
+type SnapshotOverrides = {
+  config?: Partial<DashboardSnapshot["config"]>;
   runtime?: Partial<DashboardSnapshot["runtime"]>;
   runs?: DashboardRunRecord[];
+  sales?: DashboardSnapshot["sales"];
+  attempts?: DashboardSnapshot["attempts"];
 };
 
 export function createSnapshot(overrides: SnapshotOverrides = {}): DashboardSnapshot {
@@ -238,6 +242,10 @@ export function createSnapshot(overrides: SnapshotOverrides = {}): DashboardSnap
   return {
     ...snapshot,
     ...overrides,
+    config: {
+      ...snapshot.config,
+      ...overrides.config,
+    },
     runtime: {
       ...snapshot.runtime,
       ...overrides.runtime,

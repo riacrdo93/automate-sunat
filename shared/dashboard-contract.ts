@@ -149,6 +149,7 @@ export interface DashboardSnapshot {
   config: {
     profile: string;
     runMode: "manual" | "hourly" | "both";
+    autoContinueStepTwo: boolean;
     checkIntervalMinutes: number;
     headful: boolean;
     baseUrl: string;

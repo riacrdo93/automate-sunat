@@ -41,11 +41,11 @@ describe("WorkflowStepper", () => {
         currentWorkflowStageId: undefined,
         currentWorkflowStepId: undefined,
         pendingApprovals: [],
-        stepTwoReady: {
-          available: true,
-          pendingSales: 1,
-          message: "1 venta(s) guardada(s) del paso 1 listas para ejecutar solo el paso 2.",
-        },
+          stepTwoReady: {
+            available: true,
+            pendingSales: 1,
+            message: "1 venta(s) guardada(s) del paso 1 listas para continuar con el paso 2.",
+          },
       },
     });
     const run = createHistoricalRun();

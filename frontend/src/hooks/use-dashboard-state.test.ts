@@ -34,6 +34,7 @@ describe("useDashboardState helpers", () => {
           config: {
             profile: "custom",
             runMode: "manual",
+            autoContinueStepTwo: false,
             checkIntervalMinutes: 60,
             headful: true,
             baseUrl: "http://localhost:3030",

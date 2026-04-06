@@ -132,7 +132,7 @@ export class AutomationCoordinator {
     if (!reusableSales.length) {
       return {
         started: false,
-        message: "No hay ventas guardadas del paso 1 listas para ejecutar el paso 2.",
+        message: "No hay ventas guardadas del paso 1 listas para continuar con el paso 2.",
       };
     }
 
@@ -221,6 +221,7 @@ export class AutomationCoordinator {
       config: {
         profile: this.config.profileKind,
         runMode: this.config.runMode,
+        autoContinueStepTwo: this.config.autoContinueStepTwo,
         checkIntervalMinutes: this.config.checkIntervalMinutes,
         headful: this.config.headful,
         baseUrl: this.config.appBaseUrl,
@@ -333,14 +334,23 @@ export class AutomationCoordinator {
         }
       }
 
-      if (salesForSunat.length > 0) {
+      if ((stepTwoOnly || this.config.autoContinueStepTwo) && salesForSunat.length > 0) {
         await this.processSunatRegistrations(salesForSunat);
+      } else if (salesForSunat.length > 0) {
+        this.appendRunLog({
+          level: "info",
+          stageId: "registrar_facturas_sunat",
+          stepId: "abrir_sunat",
+          message: `Paso 2 listo para continuar con ${salesForSunat.length} venta(s) exportada(s) desde el paso 1.`,
+        });
       }
 
       this.runtime.currentStep = stepTwoOnly
         ? `Paso 2 completado con ${salesForSunat.length} venta(s) guardada(s) del paso 1`
+        : this.config.autoContinueStepTwo && salesForSunat.length > 0
+          ? `Workflow completado con ${salesForSunat.length} venta(s) procesada(s) automáticamente`
         : salesForSunat.length > 0
-          ? `Paso 2 preparado para ${salesForSunat.length} venta(s) exportada(s) desde Falabella`
+          ? `Paso 1 completado con ${salesForSunat.length} venta(s); el paso 2 queda listo para continuar`
           : observedSales.length > 0
             ? `Paso 1 completado: ${observedSales.length} venta(s) exportada(s); sin nuevas ventas para SUNAT`
             : "Paso 1 completado: no se encontraron ventas pendientes";
@@ -620,14 +630,14 @@ export class AutomationCoordinator {
       return {
         available: false,
         pendingSales: 0,
-        message: "No hay ventas guardadas del paso 1 listas para ejecutar solo el paso 2.",
+        message: "No hay ventas guardadas del paso 1 listas para continuar con el paso 2.",
       };
     }
 
     return {
       available: true,
       pendingSales,
-      message: `${pendingSales} venta(s) guardada(s) del paso 1 listas para ejecutar solo el paso 2.`,
+      message: `${pendingSales} venta(s) guardada(s) del paso 1 listas para continuar con el paso 2.`,
     };
   }
 

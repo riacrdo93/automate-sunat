@@ -127,7 +127,7 @@ describe("failed / ended runs", () => {
         stepTwoReady: {
           available: false,
           pendingSales: 0,
-          message: "No hay ventas guardadas del paso 1 listas para ejecutar solo el paso 2.",
+          message: "No hay ventas guardadas del paso 1 listas para continuar con el paso 2.",
         },
       },
       runs: [run],
@@ -166,7 +166,7 @@ describe("workflow stage focus", () => {
         stepTwoReady: {
           available: true,
           pendingSales: 2,
-          message: "2 venta(s) guardada(s) del paso 1 listas para ejecutar solo el paso 2.",
+          message: "2 venta(s) guardada(s) del paso 1 listas para continuar con el paso 2.",
         },
       },
       runs: [run],

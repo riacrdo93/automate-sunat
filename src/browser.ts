@@ -65,6 +65,30 @@ export function isFalabellaDocumentsUrl(url: string): boolean {
   return /sellercenter\.falabella\.com\/order\/invoice/i.test(url);
 }
 
+export function falabellaDocumentsTextLooksEmpty(text: string): boolean {
+  const normalized = text.replace(/\s+/g, " ").trim().toLowerCase();
+
+  if (!normalized) {
+    return false;
+  }
+
+  return [
+    "no hay datos",
+    "sin resultados",
+    "no encontramos resultados",
+    "no se encontraron resultados",
+    "no hay registros",
+    "no hay documentos tributarios",
+    "no existen datos",
+    "ningun resultado",
+    "ningún resultado",
+    "no hay informacion disponible",
+    "no hay información disponible",
+    "no data",
+    "no data found",
+  ].some((pattern) => normalized.includes(pattern));
+}
+
 export class ConfigurableSellerSource implements SellerSource {
   constructor(
     private readonly config: AppConfig,
@@ -89,113 +113,142 @@ export class ConfigurableSellerSource implements SellerSource {
       await page.goto(this.profile.seller.salesUrl, { waitUntil: "domcontentloaded" });
       await page.waitForSelector(this.profile.seller.saleRowSelector);
 
-      const rowCount = await page.locator(this.profile.seller.saleRowSelector).count();
+      const seenSales = new Set<string>();
       const sales: Sale[] = [];
+      const visitedPageStates = new Set<string>();
+      let visitedPages = 0;
 
-      for (let index = 0; index < rowCount; index += 1) {
-        const row = page.locator(this.profile.seller.saleRowSelector).nth(index);
-        const detailHref = await row
-          .locator(this.profile.seller.detailLinkSelector)
-          .first()
-          .getAttribute("href");
+      while (true) {
+        await page.waitForSelector(this.profile.seller.saleRowSelector);
+        const pageState = await this.buildSellerPageStateKey(page);
 
-        if (!detailHref) {
-          continue;
+        if (visitedPageStates.has(pageState)) {
+          break;
         }
 
-        const externalId = await readText(row, this.profile.seller.saleIdSelector);
-        await onStep(`Leyendo la venta ${externalId} del seller`);
-        const detailUrl = new URL(detailHref, this.profile.seller.salesUrl).toString();
-        const detailPage = await context.newPage();
+        visitedPageStates.add(pageState);
+        visitedPages += 1;
+        await onStep(`Revisando la página ${visitedPages} de ventas del seller`);
 
-        try {
-          await detailPage.goto(detailUrl, { waitUntil: "domcontentloaded" });
-          await detailPage.waitForSelector(this.profile.seller.detailPage.itemRowSelector);
+        const rowCount = await page.locator(this.profile.seller.saleRowSelector).count();
 
-          const itemCount = await detailPage
-            .locator(this.profile.seller.detailPage.itemRowSelector)
-            .count();
-          const items: SaleItem[] = [];
+        for (let index = 0; index < rowCount; index += 1) {
+          const row = page.locator(this.profile.seller.saleRowSelector).nth(index);
+          const detailHref = await row
+            .locator(this.profile.seller.detailLinkSelector)
+            .first()
+            .getAttribute("href");
 
-          for (let itemIndex = 0; itemIndex < itemCount; itemIndex += 1) {
-            const itemRow = detailPage
-              .locator(this.profile.seller.detailPage.itemRowSelector)
-              .nth(itemIndex);
-            const quantity = parseAmount(
-              await readText(itemRow, this.profile.seller.detailPage.itemQuantitySelector),
-            );
-            const unitPrice = parseAmount(
-              await readText(itemRow, this.profile.seller.detailPage.itemUnitPriceSelector),
-            );
-            const itemTotalSelector = this.profile.seller.detailPage.itemTotalSelector;
-            const total =
-              itemTotalSelector && (await itemRow.locator(itemTotalSelector).count()) > 0
-                ? parseAmount(await readText(itemRow, itemTotalSelector))
-                : quantity * unitPrice;
-
-            items.push({
-              description: await readText(
-                itemRow,
-                this.profile.seller.detailPage.itemDescriptionSelector,
-              ),
-              quantity,
-              unitPrice,
-              total,
-            });
+          if (!detailHref) {
+            continue;
           }
 
-          const total = await readPreferredAmount({
-            primaryScope: row,
-            primarySelector: this.profile.seller.totalSelector,
-            fallbackScope: detailPage,
-            fallbackSelector: this.profile.seller.detailPage.totalSelector,
-          });
-          const subtotal = items.reduce((sum, item) => sum + item.total, 0);
-          sales.push(
-            normalizeSale({
-              externalId,
-              issuedAt: await readPreferredText({
-                primaryScope: row,
-                primarySelector: this.profile.seller.issuedAtSelector,
-                fallbackScope: detailPage,
-                fallbackSelector: this.profile.seller.detailPage.issuedAtSelector,
+          const externalId = await readText(row, this.profile.seller.saleIdSelector);
+          if (seenSales.has(externalId)) {
+            continue;
+          }
+
+          await onStep(`Leyendo la venta ${externalId} del seller`);
+          const detailUrl = new URL(detailHref, this.profile.seller.salesUrl).toString();
+          const detailPage = await context.newPage();
+
+          try {
+            await detailPage.goto(detailUrl, { waitUntil: "domcontentloaded" });
+            await detailPage.waitForSelector(this.profile.seller.detailPage.itemRowSelector);
+
+            const itemCount = await detailPage
+              .locator(this.profile.seller.detailPage.itemRowSelector)
+              .count();
+            const items: SaleItem[] = [];
+
+            for (let itemIndex = 0; itemIndex < itemCount; itemIndex += 1) {
+              const itemRow = detailPage
+                .locator(this.profile.seller.detailPage.itemRowSelector)
+                .nth(itemIndex);
+              const quantity = parseAmount(
+                await readText(itemRow, this.profile.seller.detailPage.itemQuantitySelector),
+              );
+              const unitPrice = parseAmount(
+                await readText(itemRow, this.profile.seller.detailPage.itemUnitPriceSelector),
+              );
+              const itemTotalSelector = this.profile.seller.detailPage.itemTotalSelector;
+              const total =
+                itemTotalSelector && (await itemRow.locator(itemTotalSelector).count()) > 0
+                  ? parseAmount(await readText(itemRow, itemTotalSelector))
+                  : quantity * unitPrice;
+
+              items.push({
+                description: await readText(
+                  itemRow,
+                  this.profile.seller.detailPage.itemDescriptionSelector,
+                ),
+                quantity,
+                unitPrice,
+                total,
+              });
+            }
+
+            const total = await readPreferredAmount({
+              primaryScope: row,
+              primarySelector: this.profile.seller.totalSelector,
+              fallbackScope: detailPage,
+              fallbackSelector: this.profile.seller.detailPage.totalSelector,
+            });
+            const subtotal = items.reduce((sum, item) => sum + item.total, 0);
+            sales.push(
+              normalizeSale({
+                externalId,
+                issuedAt: await readPreferredText({
+                  primaryScope: row,
+                  primarySelector: this.profile.seller.issuedAtSelector,
+                  fallbackScope: detailPage,
+                  fallbackSelector: this.profile.seller.detailPage.issuedAtSelector,
+                }),
+                currency: "PEN",
+                customer: {
+                  name: await readPreferredText({
+                    primaryScope: row,
+                    primarySelector: this.profile.seller.customerNameSelector,
+                    fallbackScope: detailPage,
+                    fallbackSelector: this.profile.seller.detailPage.customerNameSelector,
+                  }),
+                  documentNumber: await readPreferredText({
+                    primaryScope: row,
+                    primarySelector: this.profile.seller.customerDocumentSelector,
+                    fallbackScope: detailPage,
+                    fallbackSelector: this.profile.seller.detailPage.customerDocumentSelector,
+                  }),
+                  email: await readPreferredOptionalText({
+                    primaryScope: row,
+                    primarySelector: this.profile.seller.customerEmailSelector,
+                    fallbackScope: detailPage,
+                    fallbackSelector: this.profile.seller.detailPage.customerEmailSelector,
+                  }),
+                },
+                items,
+                totals: {
+                  subtotal,
+                  tax: Math.max(total - subtotal, 0),
+                  total: total || subtotal,
+                },
+                raw: {
+                  detailUrl,
+                },
               }),
-              currency: "PEN",
-              customer: {
-                name: await readPreferredText({
-                  primaryScope: row,
-                  primarySelector: this.profile.seller.customerNameSelector,
-                  fallbackScope: detailPage,
-                  fallbackSelector: this.profile.seller.detailPage.customerNameSelector,
-                }),
-                documentNumber: await readPreferredText({
-                  primaryScope: row,
-                  primarySelector: this.profile.seller.customerDocumentSelector,
-                  fallbackScope: detailPage,
-                  fallbackSelector: this.profile.seller.detailPage.customerDocumentSelector,
-                }),
-                email: await readPreferredOptionalText({
-                  primaryScope: row,
-                  primarySelector: this.profile.seller.customerEmailSelector,
-                  fallbackScope: detailPage,
-                  fallbackSelector: this.profile.seller.detailPage.customerEmailSelector,
-                }),
-              },
-              items,
-              totals: {
-                subtotal,
-                tax: Math.max(total - subtotal, 0),
-                total: total || subtotal,
-              },
-              raw: {
-                detailUrl,
-              },
-            }),
-          );
-        } finally {
-          await detailPage.close();
+            );
+            seenSales.add(externalId);
+          } finally {
+            await detailPage.close();
+          }
+        }
+
+        const movedToNextPage = await this.goToNextSellerSalesPage(page, pageState);
+        if (!movedToNextPage) {
+          break;
         }
       }
+
+      await onStep(`Revisión del seller completada: ${visitedPages} página(s) inspeccionada(s).`);
 
       await context.storageState({ path: this.authFile("seller.json") });
       return sales;
@@ -267,6 +320,77 @@ export class ConfigurableSellerSource implements SellerSource {
 
   private authFile(fileName: string): string {
     return path.join(this.config.dataPaths.authDir, fileName);
+  }
+
+  private async buildSellerPageStateKey(page: Page): Promise<string> {
+    const firstRow = page.locator(this.profile.seller.saleRowSelector).first();
+    const rowKey = await firstRow.getAttribute("data-row-key").catch(() => null);
+    const firstRowText = ((await firstRow.textContent().catch(() => "")) ?? "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 160);
+    const rowCount = await page.locator(this.profile.seller.saleRowSelector).count().catch(() => 0);
+
+    return `${page.url()}|${rowKey ?? (firstRowText || "no-row")}|${rowCount}`;
+  }
+
+  private async goToNextSellerSalesPage(page: Page, previousState: string): Promise<boolean> {
+    const nextControl = await this.findNextSellerPageControl(page);
+
+    if (!nextControl) {
+      return false;
+    }
+
+    const previousUrl = page.url();
+    await nextControl.scrollIntoViewIfNeeded().catch(() => undefined);
+    await nextControl.click({ noWaitAfter: true }).catch(() => undefined);
+
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      await page.waitForTimeout(300);
+      const currentState = await this.buildSellerPageStateKey(page);
+      if (currentState !== previousState || page.url() !== previousUrl) {
+        await page.waitForSelector(this.profile.seller.saleRowSelector);
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private async findNextSellerPageControl(page: Page): Promise<Locator | undefined> {
+    const candidates = [
+      page.locator("li.ant-pagination-next button").first(),
+      page.locator("li.ant-pagination-next").first(),
+      page.locator(".pagination .next:not(.disabled) a, .pagination .next:not(.disabled) button").first(),
+      page.locator("a[rel='next'], button[rel='next']").first(),
+      page.locator("[aria-label*='next' i], [title*='next' i]").first(),
+      page.getByRole("button", { name: /siguiente|next|pr[oó]xima|>/i }).first(),
+      page.getByRole("link", { name: /siguiente|next|pr[oó]xima|>/i }).first(),
+    ];
+
+    for (const candidate of candidates) {
+      if (!(await candidate.isVisible().catch(() => false))) {
+        continue;
+      }
+
+      const disabled =
+        (await candidate.isDisabled().catch(() => false))
+        || (await candidate.getAttribute("disabled").catch(() => null)) !== null
+        || (await candidate.getAttribute("aria-disabled").catch(() => null)) === "true"
+        || (await candidate
+          .evaluate((element) =>
+            element.classList.contains("disabled")
+              || element.classList.contains("ant-pagination-disabled")
+              || element.classList.contains("is-disabled"))
+          .catch(() => false));
+
+      if (!disabled) {
+        return candidate;
+      }
+    }
+
+    return undefined;
   }
 
   private async loginIfNeeded(
@@ -429,6 +553,7 @@ export class SunatPortalEmitter implements InvoiceEmitter {
     try {
       await browserContext.tracing.start({ screenshots: true, snapshots: true });
       await this.loginIfNeeded(page, onStep);
+      await dismissSunatNotificationsPrompt(page, onStep);
 
       if (this.profile.sunat.postLoginMenuLabels?.length) {
         await navigateSunatSolMenu(page, this.profile.sunat.postLoginMenuLabels, onStep);
@@ -874,10 +999,10 @@ async function loginToFalabella(
   const ordersMenu = page.getByRole("link", { name: /Órdenes/i }).first();
 
   await Promise.race([
-    emailField.waitFor({ state: "visible", timeout: 20_000 }).catch(() => undefined),
-    passwordField.waitFor({ state: "visible", timeout: 20_000 }).catch(() => undefined),
-    omitButton.waitFor({ state: "visible", timeout: 20_000 }).catch(() => undefined),
-    ordersMenu.waitFor({ state: "visible", timeout: 20_000 }).catch(() => undefined),
+    emailField.waitFor({ state: "visible", timeout: 8_000 }).catch(() => undefined),
+    passwordField.waitFor({ state: "visible", timeout: 8_000 }).catch(() => undefined),
+    omitButton.waitFor({ state: "visible", timeout: 8_000 }).catch(() => undefined),
+    ordersMenu.waitFor({ state: "visible", timeout: 8_000 }).catch(() => undefined),
   ]);
 
   if (await omitButton.isVisible().catch(() => false)) {
@@ -893,32 +1018,21 @@ async function loginToFalabella(
 
   if (await passwordField.isVisible().catch(() => false)) {
     await passwordField.fill(credentials.password);
-    await page.waitForTimeout(1_000);
 
     const signInButton = page.getByRole("button", { name: /Iniciar sesi[oó]n/i }).first();
     await signInButton.click({ noWaitAfter: true }).catch(() => undefined);
-    await page.waitForTimeout(2_500);
+    await waitForFalabellaPostLogin(page, 8_000);
 
     if (await passwordField.isVisible().catch(() => false)) {
       await signInButton.click({ noWaitAfter: true }).catch(() => undefined);
+      await waitForFalabellaPostLogin(page, 8_000);
     }
   }
 
-  await Promise.race([
-    omitButton.waitFor({ state: "visible", timeout: 20_000 }).catch(() => undefined),
-    ordersMenu.waitFor({ state: "visible", timeout: 20_000 }).catch(() => undefined),
-  ]);
-  await page.waitForTimeout(2_000);
+  await waitForFalabellaPostLogin(page, 8_000);
   await dismissFalabellaPopup(page);
 }
 
-async function dismissFalabellaPopup(page: Page): Promise<void> {
-  const omitButton = page.getByRole("button", { name: /Omitir/i }).first();
-  if (await omitButton.isVisible().catch(() => false)) {
-    await omitButton.click({ noWaitAfter: true }).catch(() => undefined);
-    await page.waitForTimeout(1_000);
-  }
-}
 
 async function openFalabellaDocumentsPage(
   page: Page,
@@ -926,37 +1040,48 @@ async function openFalabellaDocumentsPage(
   onStep: StepReporter,
 ): Promise<void> {
   await onStep("Abriendo Documentos tributarios en Falabella");
+  await dismissFalabellaSettlementModal(page, onStep);
 
   const ordersMenu = page.getByRole("link", { name: /Órdenes/i }).first();
   const documentsOption = page.getByRole("link", { name: /Documentos tributarios/i }).first();
 
   if (await ordersMenu.isVisible().catch(() => false)) {
     await ordersMenu.hover().catch(() => undefined);
-    await page.waitForTimeout(600);
+    await dismissFalabellaSettlementModal(page, onStep);
+    await documentsOption.waitFor({ state: "visible", timeout: 2_000 }).catch(() => undefined);
   }
 
   if (await documentsOption.isVisible().catch(() => false)) {
     await documentsOption.click({ noWaitAfter: true }).catch(() => undefined);
-    await page.waitForTimeout(8_000);
+    await dismissFalabellaSettlementModal(page, onStep);
+    const readyState = await waitForFalabellaDocumentsReadyState(page, onStep, 15_000);
+    if (readyState === "rows" || readyState === "empty") {
+      return;
+    }
   } else {
     await page.goto(url, {
       waitUntil: "domcontentloaded",
       timeout: 60_000,
     });
     await persistFalabellaLocalStorage(page);
-    await page.waitForTimeout(8_000);
+    await dismissFalabellaSettlementModal(page, onStep);
+    const readyState = await waitForFalabellaDocumentsReadyState(page, onStep, 15_000);
+    if (readyState === "rows" || readyState === "empty") {
+      return;
+    }
   }
 
-  if (!(await page.locator("tbody tr[data-row-key]").first().isVisible().catch(() => false))) {
-    await page.goto(url, {
-      waitUntil: "domcontentloaded",
-      timeout: 60_000,
-    });
-    await persistFalabellaLocalStorage(page);
-    await page.waitForTimeout(10_000);
-  }
+  await page.goto(url, {
+    waitUntil: "domcontentloaded",
+    timeout: 60_000,
+  });
+  await persistFalabellaLocalStorage(page);
+  await dismissFalabellaSettlementModal(page, onStep);
 
-  await page.locator("tbody tr[data-row-key]").first().waitFor({ state: "visible", timeout: 30_000 });
+  const readyState = await waitForFalabellaDocumentsReadyState(page, onStep, 25_000);
+  if (readyState === "timeout") {
+    throw new Error("Falabella no mostró la tabla de Documentos tributarios a tiempo.");
+  }
 }
 
 type FalabellaPaginationState = {
@@ -970,6 +1095,12 @@ async function collectFalabellaPendingRowsAcrossPages(
   page: Page,
   onStep: StepReporter,
 ): Promise<FalabellaRowCandidate[]> {
+  const initialState = await waitForFalabellaDocumentsReadyState(page, onStep);
+  if (initialState === "empty") {
+    await onStep("Documentos tributarios: la bandeja cargó sin órdenes pendientes.");
+    return [];
+  }
+
   await ensureFalabellaDocumentsStartFromFirstPage(page, onStep);
   const collected = new Map<string, FalabellaRowCandidate>();
   const visitedPageStates = new Set<string>();
@@ -990,7 +1121,9 @@ async function collectFalabellaPendingRowsAcrossPages(
     await onStep(
       pagination.totalPages > 1
         ? `Documentos tributarios: revisando página ${pagination.currentPage} de ${pagination.totalPages}.`
-        : "Documentos tributarios: revisando la única página disponible.",
+        : pagination.hasNextPage
+          ? `Documentos tributarios: revisando página ${pagination.currentPage} (detectando total de páginas).`
+          : "Documentos tributarios: revisando la única página disponible.",
     );
 
     const pageCandidates = await collectFalabellaPendingRowsFromCurrentPage(page);
@@ -1023,6 +1156,12 @@ async function findFalabellaPendingRowByOrderIdAcrossPages(
   orderId: string,
   onStep: StepReporter,
 ): Promise<FalabellaRowCandidate | undefined> {
+  const initialState = await waitForFalabellaDocumentsReadyState(page, onStep);
+  if (initialState === "empty") {
+    await onStep("Documentos tributarios: la bandeja cargó sin órdenes pendientes.");
+    return undefined;
+  }
+
   await ensureFalabellaDocumentsStartFromFirstPage(page, onStep);
   const visitedPageStates = new Set<string>();
 
@@ -1057,7 +1196,9 @@ async function findFalabellaPendingRowByOrderIdAcrossPages(
 
 async function collectFalabellaPendingRowsFromCurrentPage(page: Page): Promise<FalabellaRowCandidate[]> {
   const rows = page.locator("tbody tr[data-row-key]");
-  await rows.first().waitFor({ state: "visible", timeout: 30_000 });
+  if (!(await rows.first().isVisible().catch(() => false))) {
+    return [];
+  }
   const count = await rows.count();
   const candidates: FalabellaRowCandidate[] = [];
 
@@ -1101,8 +1242,121 @@ async function readFalabellaRowOrderId(row: Locator): Promise<string> {
   return ((orderId ?? "").match(/\d+/)?.[0] ?? "").trim();
 }
 
-async function waitForFalabellaDocumentsRows(page: Page): Promise<void> {
-  await page.locator("tbody tr[data-row-key]").first().waitFor({ state: "visible", timeout: 30_000 });
+async function waitForFalabellaPostLogin(page: Page, timeoutMs = 20_000): Promise<void> {
+  const omitButton = page.getByRole("button", { name: /Omitir/i }).first();
+  const ordersMenu = page.getByRole("link", { name: /Órdenes/i }).first();
+  const documentsOption = page.getByRole("link", { name: /Documentos tributarios/i }).first();
+
+  await Promise.race([
+    omitButton.waitFor({ state: "visible", timeout: timeoutMs }).catch(() => undefined),
+    ordersMenu.waitFor({ state: "visible", timeout: timeoutMs }).catch(() => undefined),
+    documentsOption.waitFor({ state: "visible", timeout: timeoutMs }).catch(() => undefined),
+    page.waitForLoadState("domcontentloaded").catch(() => undefined),
+  ]);
+}
+
+async function dismissFalabellaPopup(page: Page): Promise<void> {
+  const omitButton = page.getByRole("button", { name: /Omitir/i }).first();
+
+  if (await omitButton.isVisible().catch(() => false)) {
+    await omitButton.click({ noWaitAfter: true }).catch(() => undefined);
+  }
+}
+
+async function dismissFalabellaSettlementModal(page: Page, onStep?: StepReporter): Promise<void> {
+  const modalRoot = page
+    .locator(".settlement-invoice-app")
+    .filter({ has: page.locator(".ant-modal-content, .modal-content, [role='dialog']") })
+    .first();
+
+  if (!(await modalRoot.isVisible().catch(() => false))) {
+    return;
+  }
+
+  const closeCandidates = [
+    modalRoot.locator(".ant-modal-close, .ant-modal-close-x").first(),
+    modalRoot.getByRole("button", { name: /cancelar|cerrar|close|x/i }).first(),
+    modalRoot.locator("button[aria-label*='close' i], button[title*='close' i]").first(),
+    modalRoot.locator(".modal-header button, .close").first(),
+  ];
+
+  for (const candidate of closeCandidates) {
+    if (await candidate.isVisible().catch(() => false)) {
+      await onStep?.("Falabella mostró un modal de liquidación; lo cierro para continuar.");
+      await candidate.click({ noWaitAfter: true }).catch(() => undefined);
+      await page.waitForTimeout(250);
+      return;
+    }
+  }
+}
+
+async function waitForFalabellaDocumentsRows(page: Page, timeoutMs = 30_000): Promise<boolean> {
+  await page.waitForLoadState("domcontentloaded").catch(() => undefined);
+  return page
+    .locator("tbody tr[data-row-key]")
+    .first()
+    .waitFor({ state: "visible", timeout: timeoutMs })
+    .then(() => true)
+    .catch(() => false);
+}
+
+type FalabellaDocumentsReadyState = "rows" | "empty" | "timeout";
+
+async function waitForFalabellaDocumentsReadyState(
+  page: Page,
+  onStep?: StepReporter,
+  timeoutMs = 30_000,
+): Promise<FalabellaDocumentsReadyState> {
+  const deadline = Date.now() + timeoutMs;
+  let nextProgressLogAt = Date.now() + 5_000;
+
+  while (Date.now() < deadline) {
+    await dismissFalabellaSettlementModal(page, onStep);
+
+    if (await waitForFalabellaDocumentsRows(page, 750)) {
+      return "rows";
+    }
+
+    if (await hasFalabellaDocumentsEmptyState(page)) {
+      return "empty";
+    }
+
+    if (Date.now() >= nextProgressLogAt) {
+      await onStep?.("Documentos tributarios: esperando que Falabella termine de cargar la bandeja.");
+      nextProgressLogAt = Date.now() + 5_000;
+    }
+
+    await page.waitForTimeout(350);
+  }
+
+  return "timeout";
+}
+
+async function hasFalabellaDocumentsEmptyState(page: Page): Promise<boolean> {
+  const candidates = [
+    page.locator("tr.ant-table-placeholder").first(),
+    page.locator(".ant-table-placeholder").first(),
+    page.locator(".ant-empty").first(),
+    page.locator(".ant-empty-description").first(),
+    page.locator(".settlement-invoice-app .ant-table-tbody tr td[colspan]").first(),
+    page.locator(".settlement-invoice-app .empty-state, .settlement-invoice-app .no-data").first(),
+  ];
+
+  for (const candidate of candidates) {
+    if (!(await candidate.isVisible().catch(() => false))) {
+      continue;
+    }
+
+    const text = ((await candidate.textContent().catch(() => "")) ?? "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (falabellaDocumentsTextLooksEmpty(text)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 async function ensureFalabellaDocumentsStartFromFirstPage(
@@ -1160,33 +1414,95 @@ async function buildFalabellaPageStateKey(page: Page, currentPage: number): Prom
 }
 
 async function readFalabellaPaginationState(page: Page): Promise<FalabellaPaginationState> {
-  const pageLabels = (await page.locator("li.ant-pagination-item").allTextContents().catch(() => []))
-    .map((label) => label.replace(/\s+/g, " ").trim())
-    .map((label) => Number(label))
-    .filter((value) => Number.isFinite(value) && value > 0);
-
-  const currentLabel = ((await page
-    .locator("li.ant-pagination-item-active")
-    .first()
-    .textContent()
-    .catch(() => "")) ?? "")
-    .replace(/\s+/g, " ")
-    .trim();
+  const paginationRoot = await findFalabellaDocumentsPaginationRoot(page);
+  const scope = paginationRoot ?? page;
+  const pageLabels = Array.from(
+    new Set(
+      (await scope
+        .locator("li.ant-pagination-item, button, [role='button'], a, span")
+        .allTextContents()
+        .catch(() => []))
+        .map((label) => label.replace(/\s+/g, " ").trim())
+        .map((label) => Number(label))
+        .filter((value) => Number.isFinite(value) && value > 0),
+    ),
+  );
+  const currentLabel = await readFalabellaCurrentPaginationLabel(scope);
   const currentPage = Number(currentLabel) || 1;
-  const totalPages = pageLabels.length ? Math.max(...pageLabels) : currentPage;
-  const nextItem = page.locator("li.ant-pagination-next").first();
-  const nextVisible = await nextItem.isVisible().catch(() => false);
-  const nextDisabled =
-    !nextVisible
-    || (await nextItem.getAttribute("aria-disabled").catch(() => null)) === "true"
-    || (await nextItem.evaluate((element) => element.classList.contains("ant-pagination-disabled")).catch(() => false));
+  const inferredTotalFromLabels = pageLabels.length ? Math.max(...pageLabels) : currentPage;
+  const hintedTotal = await readFalabellaTotalPagesHint(scope);
+  const totalPages = Math.max(inferredTotalFromLabels, hintedTotal ?? currentPage);
+  const nextItem = await findFalabellaNextPaginationControl(page);
+  const nextDisabled = nextItem ? await isFalabellaPaginationControlDisabled(nextItem) : true;
 
   return {
     currentPage,
     totalPages,
-    hasNextPage: nextVisible && !nextDisabled,
-    nextPage: nextVisible && !nextDisabled ? currentPage + 1 : undefined,
+    hasNextPage: Boolean(nextItem) && !nextDisabled && currentPage < Math.max(totalPages, currentPage + 1),
+    nextPage: Boolean(nextItem) && !nextDisabled ? currentPage + 1 : undefined,
   };
+}
+
+async function readFalabellaCurrentPaginationLabel(scope: Page | Locator): Promise<string> {
+  const selectors = [
+    "li.ant-pagination-item-active",
+    "[aria-current='page']",
+    ".active",
+    ".selected",
+    "[aria-selected='true']",
+  ];
+
+  for (const selector of selectors) {
+    const text = ((await scope.locator(selector).first().textContent().catch(() => "")) ?? "")
+      .replace(/\s+/g, " ")
+      .trim();
+    const match = text.match(/\d+/)?.[0];
+
+    if (match) {
+      return match;
+    }
+  }
+
+  return "";
+}
+
+async function readFalabellaTotalPagesHint(scope: Page | Locator): Promise<number | undefined> {
+  const texts = (await scope.locator(".ant-pagination, .pagination, li, span, div").allTextContents().catch(() => []))
+    .map((value) => value.replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .slice(0, 40);
+
+  for (const text of texts) {
+    const slash = text.match(/\b(\d+)\s*\/\s*(\d+)\b/);
+    if (slash) {
+      const total = Number(slash[2]);
+      if (Number.isFinite(total) && total > 0) {
+        return total;
+      }
+    }
+
+    const spanish = text.match(/\b(?:de|total)\s*(\d+)\b/i);
+    if (spanish) {
+      const total = Number(spanish[1]);
+      if (Number.isFinite(total) && total > 0) {
+        return total;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+async function isFalabellaPaginationControlDisabled(control: Locator): Promise<boolean> {
+  return (
+    (await control.isDisabled().catch(() => false))
+    || (await control.getAttribute("disabled").catch(() => null)) !== null
+    || (await control.getAttribute("aria-disabled").catch(() => null)) === "true"
+    || (await control
+      .evaluate((element) =>
+        element.classList.contains("disabled") || element.classList.contains("ant-pagination-disabled"))
+      .catch(() => false))
+  );
 }
 
 async function goToNextFalabellaDocumentsPage(
@@ -1209,18 +1525,15 @@ async function findFalabellaPaginationPageControl(
   page: Page,
   targetPage: number,
 ): Promise<Locator | undefined> {
-  const control = page
-    .locator("li.ant-pagination-item")
-    .filter({ hasText: new RegExp(`^\\s*${targetPage}\\s*$`) })
-    .first();
-
-  return (await control.isVisible().catch(() => false)) ? control : undefined;
-}
-
-async function findFalabellaNextPaginationControl(page: Page): Promise<Locator | undefined> {
+  const paginationRoot = await findFalabellaDocumentsPaginationRoot(page);
+  const scope = paginationRoot ?? page;
   const candidates = [
-    page.locator("li.ant-pagination-next button").first(),
-    page.locator("li.ant-pagination-next").first(),
+    scope
+      .locator("li.ant-pagination-item")
+      .filter({ hasText: new RegExp(`^\\s*${targetPage}\\s*$`) })
+      .first(),
+    scope.getByRole("button", { name: new RegExp(`^\\s*${targetPage}\\s*$`) }).first(),
+    scope.getByText(new RegExp(`^\\s*${targetPage}\\s*$`)).first(),
   ];
 
   for (const candidate of candidates) {
@@ -1232,19 +1545,88 @@ async function findFalabellaNextPaginationControl(page: Page): Promise<Locator |
   return undefined;
 }
 
-async function findFalabellaPreviousPaginationControl(page: Page): Promise<Locator | undefined> {
+async function findFalabellaNextPaginationControl(page: Page): Promise<Locator | undefined> {
+  const paginationRoot = await findFalabellaDocumentsPaginationRoot(page);
+  const scope = paginationRoot ?? page;
   const candidates = [
-    page.locator("li.ant-pagination-prev button").first(),
-    page.locator("li.ant-pagination-prev").first(),
+    scope.locator("li.ant-pagination-next button").first(),
+    scope.locator("li.ant-pagination-next").first(),
+    scope.locator("[aria-label*='next' i]").first(),
+    scope.locator("[title*='next' i]").first(),
+    scope.getByRole("button", { name: /^\s*>\s*$/ }).first(),
+    scope.getByText(/^\s*>\s*$/).first(),
   ];
 
   for (const candidate of candidates) {
     if (await candidate.isVisible().catch(() => false)) {
-      const disabled =
-        (await candidate.getAttribute("aria-disabled").catch(() => null)) === "true"
-        || (await candidate
-          .evaluate((element) => element.classList.contains("ant-pagination-disabled"))
-          .catch(() => false));
+      const disabled = await isFalabellaPaginationControlDisabled(candidate);
+      if (!disabled) {
+        return candidate;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+async function findFalabellaDocumentsPaginationRoot(page: Page): Promise<Locator | undefined> {
+  const candidateContainers = page.locator(".settlement-invoice-pagination, ul.ant-pagination");
+  let best: { locator: Locator; score: number } | undefined;
+  const count = await candidateContainers.count().catch(() => 0);
+
+  for (let index = 0; index < count; index += 1) {
+    const candidate = candidateContainers.nth(index);
+    if (!(await candidate.isVisible().catch(() => false))) {
+      continue;
+    }
+
+    const itemCount = await candidate.locator("li.ant-pagination-item").count().catch(() => 0);
+    const hasCurrent = (await candidate.locator("li.ant-pagination-item-active, [aria-current='page']").count().catch(() => 0)) > 0;
+    const hasNext = (await candidate.locator("li.ant-pagination-next, [aria-label*='next' i], [title*='next' i]").count().catch(() => 0)) > 0;
+    const score = (itemCount * 3) + (hasCurrent ? 4 : 0) + (hasNext ? 2 : 0);
+
+    if (!best || score > best.score) {
+      best = { locator: candidate, score };
+    }
+  }
+
+  if (best) {
+    return best.locator;
+  }
+
+  const paginations = page.locator("ul.ant-pagination");
+  const paginationCount = await paginations.count().catch(() => 0);
+
+  for (let index = paginationCount - 1; index >= 0; index -= 1) {
+    const candidate = paginations.nth(index);
+    if (!(await candidate.isVisible().catch(() => false))) {
+      continue;
+    }
+
+    const itemCount = await candidate.locator("li.ant-pagination-item, li.ant-pagination-next").count().catch(() => 0);
+    if (itemCount > 0) {
+      return candidate;
+    }
+  }
+
+  return undefined;
+}
+
+async function findFalabellaPreviousPaginationControl(page: Page): Promise<Locator | undefined> {
+  const paginationRoot = await findFalabellaDocumentsPaginationRoot(page);
+  const scope = paginationRoot ?? page;
+  const candidates = [
+    scope.locator("li.ant-pagination-prev button").first(),
+    scope.locator("li.ant-pagination-prev").first(),
+    scope.locator("[aria-label*='prev' i], [aria-label*='previous' i]").first(),
+    scope.locator("[title*='prev' i], [title*='previous' i]").first(),
+    scope.getByRole("button", { name: /^\s*<\s*$/ }).first(),
+    scope.getByText(/^\s*<\s*$/).first(),
+  ];
+
+  for (const candidate of candidates) {
+    if (await candidate.isVisible().catch(() => false)) {
+      const disabled = await isFalabellaPaginationControlDisabled(candidate);
       if (!disabled) {
         return candidate;
       }
@@ -1960,11 +2342,37 @@ async function navigateSunatSolMenu(page: Page, labels: string[], onStep: StepRe
   }
 }
 
+async function dismissSunatNotificationsPrompt(page: Page, onStep?: StepReporter): Promise<void> {
+  const button = await tryFindVisibleTextTargetInPageTree(page, "Ver más tarde", 7_500);
+
+  if (!button) {
+    return;
+  }
+
+  await onStep?.("SUNAT mostró el aviso del buzón electrónico; haré click en Ver más tarde.");
+  await button.scrollIntoViewIfNeeded().catch(() => undefined);
+  await button.click().catch(() => undefined);
+  await page.waitForTimeout(750);
+}
+
 async function waitForVisibleTextTargetInPageTree(
   page: Page,
   label: string,
   timeoutMs: number,
 ): Promise<Locator> {
+  const target = await tryFindVisibleTextTargetInPageTree(page, label, timeoutMs);
+  if (target) {
+    return target;
+  }
+
+  throw new Error(`No se encontró un menú SUNAT visible para "${label}".`);
+}
+
+async function tryFindVisibleTextTargetInPageTree(
+  page: Page,
+  label: string,
+  timeoutMs: number,
+): Promise<Locator | undefined> {
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
@@ -1991,7 +2399,7 @@ async function waitForVisibleTextTargetInPageTree(
     await page.waitForTimeout(250);
   }
 
-  throw new Error(`No se encontró un menú SUNAT visible para "${label}".`);
+  return undefined;
 }
 
 async function waitForVisibleLocatorInPageTree(

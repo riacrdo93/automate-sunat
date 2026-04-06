@@ -142,6 +142,7 @@ export function DashboardWorkspace({
 
   if (!snapshot || !focusedRun) {
     if (snapshot) {
+      const autoContinueStepTwo = snapshot.config.autoContinueStepTwo;
       return (
         <div className="min-h-screen bg-background">
           <WorkflowHeader
@@ -151,6 +152,8 @@ export function DashboardWorkspace({
             totalDuration={emptyHeader.totalDuration}
             completedSteps={emptyHeader.completedSteps}
             totalSteps={emptyHeader.totalSteps}
+            startLabel={autoContinueStepTwo ? "Ejecutar workflow" : "Ejecutar paso 1"}
+            runningLabel={autoContinueStepTwo ? "Workflow en curso" : "Paso 1 en curso"}
             onStartRun={onStartRun}
             onStopRun={onStopRun}
             isRunning={snapshot.runtime.isRunning}
@@ -177,7 +180,9 @@ export function DashboardWorkspace({
                       <EmptyHeader>
                         <EmptyTitle>No hay workflows todavía</EmptyTitle>
                         <EmptyDescription>
-                          Lanza el workflow para iniciar el paso 1 y ver aquí el detalle del proceso.
+                          {snapshot.config.autoContinueStepTwo
+                            ? "Ejecuta el workflow completo y verás aquí el detalle del proceso."
+                            : "Ejecuta el paso 1 para detectar ventas y ver aquí el detalle del proceso."}
                         </EmptyDescription>
                       </EmptyHeader>
                     </Empty>
@@ -202,7 +207,7 @@ export function DashboardWorkspace({
                   <EmptyDescription>
                     {error
                       ? "El dashboard no recibio el estado inicial. Si acabas de borrar el historial, el sistema debe levantar igual con una base vacia."
-                      : "Lanza el workflow para cargar la corrida."}
+                      : "Ejecuta el workflow para cargar la corrida."}
                   </EmptyDescription>
                 </EmptyHeader>
               </Empty>
@@ -215,10 +220,13 @@ export function DashboardWorkspace({
 
   const header = buildWorkflowHeader(focusedRun, snapshot);
   const stepTwoReady = snapshot.runtime.stepTwoReady;
+  const autoContinueStepTwo = snapshot.config.autoContinueStepTwo;
+  const startRunLabel = autoContinueStepTwo ? "Ejecutar workflow" : "Ejecutar paso 1";
+  const runningRunLabel = autoContinueStepTwo ? "Workflow en curso" : "Paso 1 en curso";
   const stepAction =
-    activeStep?.id === STEP_TWO_STAGE_ID
+    activeStep?.id === STEP_TWO_STAGE_ID && !autoContinueStepTwo
       ? {
-          label: "Ejecutar solo paso 2",
+          label: "Continuar con paso 2",
           disabled: snapshot.runtime.isRunning || !stepTwoReady.available,
           loading: pendingAction === "step-2",
           hint: snapshot.runtime.isRunning
@@ -236,6 +244,8 @@ export function DashboardWorkspace({
         totalDuration={header.totalDuration}
         completedSteps={header.completedSteps}
         totalSteps={header.totalSteps}
+        startLabel={startRunLabel}
+        runningLabel={runningRunLabel}
         onStartRun={onStartRun}
         onStopRun={onStopRun}
         isRunning={snapshot.runtime.isRunning}

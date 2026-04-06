@@ -26,6 +26,7 @@ const envSchema = z.object({
     .url()
     .default("https://sellercenter.falabella.com/order/invoice#/purchased-order-list"),
   RUN_MODE: z.enum(["manual", "hourly", "both"]).default("manual"),
+  AUTO_CONTINUE_STEP_2: booleanish.default(false),
   CHECK_INTERVAL_MINUTES: z.coerce.number().int().positive().default(60),
   HEADFUL: booleanish.default(true),
   SLOW_MO_MS: z.coerce.number().int().min(0).default(250),
@@ -43,6 +44,7 @@ export interface AppConfig {
   siteProfilePath: string;
   sellerPurchasedOrdersUrl: string;
   runMode: "manual" | "hourly" | "both";
+  autoContinueStepTwo: boolean;
   checkIntervalMinutes: number;
   headful: boolean;
   slowMoMs: number;
@@ -87,6 +89,7 @@ export function loadConfig(overrides: Partial<NodeJS.ProcessEnv> = {}): AppConfi
     siteProfilePath,
     sellerPurchasedOrdersUrl: parsed.SELLER_PURCHASED_ORDERS_URL,
     runMode: parsed.RUN_MODE,
+    autoContinueStepTwo: parsed.AUTO_CONTINUE_STEP_2,
     checkIntervalMinutes: parsed.CHECK_INTERVAL_MINUTES,
     headful: parsed.HEADFUL,
     slowMoMs: parsed.SLOW_MO_MS,

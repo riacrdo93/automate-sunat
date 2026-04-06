@@ -207,7 +207,7 @@ describe("AutomationCoordinator", () => {
     expect(currentCoordinator.getSnapshot().runtime.pendingApprovals).toHaveLength(0);
   });
 
-  test("ejecuta paso 2 SUNAT sin intervención manual cuando hay ventas", async () => {
+  test("completa solo el paso 1 y deja el paso 2 listo cuando hay ventas", async () => {
     const sale = normalizeSale({
       externalId: "SALE-COORD-1",
       issuedAt: "2026-03-24T12:00:00-05:00",
@@ -243,31 +243,116 @@ describe("AutomationCoordinator", () => {
     await runPromise;
 
     const snapshot = currentCoordinator.getSnapshot();
-    const attempts = snapshot.attempts;
     const runs = snapshot.runs;
-    const attemptId = attempts[0]?.id;
-    const submittedAttempt = attempts.find((a) => a.id === attemptId);
-    const runEntry = runs[0]?.entries.find((entry) => entry.attemptId === attemptId);
-
-    expect(attempts.some((a) => a.id === attemptId && a.status === "submitted")).toBe(true);
-    expect(submittedAttempt?.receiptNumber).toBe("EB01-99999");
-    expect(submittedAttempt?.receiptPrefix).toBe("EB01");
-    expect(runEntry?.receiptPrefix).toBe("EB01");
-    expect(runs[0]?.workflowStages[1]?.status).toBe("completed");
+    expect(snapshot.attempts).toHaveLength(0);
+    expect(runs[0]?.entries).toHaveLength(0);
+    expect(runs[0]?.workflowStages[1]?.status).toBe("pending");
     expect(runs[0]?.outputJsonPath).toContain("/falabella-extract/");
     expect(runs[0]?.outputJsonContent).toContain("SALE-COORD-1");
     expect(runs[0]?.outputJsonContent).toContain("\"dni\": \"20101010101\"");
     expect(runs[0]?.outputJsonContent).toContain("\"productCount\": 1");
     expect(runs[0]?.outputJsonContent).toContain("\"total\": 350");
-    expect(runs[0]?.outputJsonContent).toContain("\"receiptNumber\": \"EB01-99999\"");
-    expect(runs[0]?.outputJsonContent).toContain("\"receiptPrefix\": \"EB01\"");
-    expect(typeof runs[0]?.summary.boletasDownloadDir).toBe("string");
-    expect(String(runs[0]?.summary.boletasDownloadDir)).toContain("/boletas-descargadas/");
+    expect(runs[0]?.outputJsonContent).not.toContain("\"receiptNumber\"");
+    expect(runs[0]?.outputJsonContent).not.toContain("\"receiptPrefix\"");
+    expect(runs[0]?.summary.boletasDownloadDir).toBeUndefined();
     expect(runs[0]?.logs.some((log) => /JSON del paso 1/i.test(log.message))).toBe(true);
     expect(runs[0]?.logs.some((log) => /Sincronizando cookies del seller/i.test(log.message))).toBe(true);
-    expect(runs[0]?.logs.some((log) => /Validación automática completada/i.test(log.message))).toBe(
-      true,
-    );
+    expect(runs[0]?.logs.some((log) => /Paso 2 listo para continuar/i.test(log.message))).toBe(true);
+    expect(snapshot.runtime.stepTwoReady.available).toBe(true);
+    expect(snapshot.runtime.stepTwoReady.pendingSales).toBe(1);
+    expect(snapshot.runtime.pendingApprovals).toHaveLength(0);
+  });
+
+  test("continua automáticamente al paso 2 cuando el flag está activo", async () => {
+    const sale = normalizeSale({
+      externalId: "SALE-AUTO-FLAG-1",
+      issuedAt: "2026-03-24T12:00:00-05:00",
+      currency: "PEN",
+      customer: {
+        name: "Cliente auto",
+        documentNumber: "20101010109",
+      },
+      items: [{ description: "Monitor", quantity: 1, unitPrice: 350, total: 350 }],
+      totals: { subtotal: 350, tax: 0, total: 350 },
+      raw: {},
+    });
+
+    const config = loadConfig({
+      APP_PORT: "3030",
+      APP_BASE_URL: "http://localhost:3030",
+      SITE_PROFILE_PATH: "./config/custom-profile.json",
+      RUN_MODE: "manual",
+      AUTO_CONTINUE_STEP_2: "true",
+      HEADFUL: "false",
+      SLOW_MO_MS: "0",
+      DATA_DIR: dataDir,
+    });
+    const currentCoordinator = (coordinator = new AutomationCoordinator(
+      config,
+      store,
+      new FakeSellerSource([sale]),
+      new FakeEmitter(),
+    ));
+
+    const runPromise = currentCoordinator.triggerManualRun();
+
+    await waitUntil(() => currentCoordinator.getSnapshot().runtime.isRunning === false);
+    await runPromise;
+
+    const snapshot = currentCoordinator.getSnapshot();
+    const attempt = snapshot.attempts.find((entry) => entry.saleExternalId === "SALE-AUTO-FLAG-1");
+
+    expect(snapshot.config.autoContinueStepTwo).toBe(true);
+    expect(attempt?.status).toBe("submitted");
+    expect(attempt?.receiptNumber).toBe("EB01-99999");
+    expect(snapshot.runs[0]?.workflowStages[1]?.status).toBe("completed");
+    expect(snapshot.runtime.stepTwoReady.available).toBe(false);
+  });
+
+  test("ejecuta el paso 2 cuando se lanza de forma explícita", async () => {
+    const saleOne = normalizeSale({
+      externalId: "SALE-STEP2-AUTO-1",
+      issuedAt: "2026-03-24T12:00:00-05:00",
+      currency: "PEN",
+      customer: {
+        name: "Cliente step 2",
+        documentNumber: "20101010111",
+      },
+      items: [{ description: "Monitor", quantity: 1, unitPrice: 350, total: 350 }],
+      totals: { subtotal: 350, tax: 0, total: 350 },
+      raw: {},
+    });
+    store.registerObservedSales([saleOne]);
+
+    const config = loadConfig({
+      APP_PORT: "3030",
+      APP_BASE_URL: "http://localhost:3030",
+      SITE_PROFILE_PATH: "./config/custom-profile.json",
+      RUN_MODE: "manual",
+      HEADFUL: "false",
+      SLOW_MO_MS: "0",
+      DATA_DIR: dataDir,
+    });
+    const currentCoordinator = (coordinator = new AutomationCoordinator(
+      config,
+      store,
+      new FakeSellerSource([]),
+      new FakeEmitter(),
+    ));
+
+    const runPromise = currentCoordinator.triggerStepTwoRun();
+
+    await waitUntil(() => currentCoordinator.getSnapshot().runtime.isRunning === false);
+    await runPromise;
+
+    const snapshot = currentCoordinator.getSnapshot();
+    const firstAttempt = snapshot.attempts.find((attempt) => attempt.saleExternalId === "SALE-STEP2-AUTO-1");
+
+    expect(firstAttempt?.status).toBe("submitted");
+    expect(firstAttempt?.receiptNumber).toBe("EB01-99999");
+    expect(snapshot.runs[0]?.workflowStages[1]?.status).toBe("completed");
+    expect(snapshot.runs[0]?.summary.boletasDownloadDir).toBeTruthy();
+    expect(snapshot.runtime.stepTwoReady.available).toBe(false);
     expect(snapshot.runtime.pendingApprovals).toHaveLength(0);
   });
 
@@ -298,6 +383,8 @@ describe("AutomationCoordinator", () => {
     });
     const emitter = new InterruptibleEmitter();
 
+    store.registerObservedSales([saleOne, saleTwo]);
+
     const config = loadConfig({
       APP_PORT: "3030",
       APP_BASE_URL: "http://localhost:3030",
@@ -310,11 +397,11 @@ describe("AutomationCoordinator", () => {
     const currentCoordinator = (coordinator = new AutomationCoordinator(
       config,
       store,
-      new FakeSellerSource([saleOne, saleTwo]),
+      new FakeSellerSource([]),
       emitter,
     ));
 
-    const runPromise = currentCoordinator.triggerManualRun();
+    const runPromise = currentCoordinator.triggerStepTwoRun();
 
     await waitUntil(() => emitter.submissions.length > 0);
     await emitter.submissions[0]!.waitUntilSubmitStarts();
@@ -335,7 +422,7 @@ describe("AutomationCoordinator", () => {
     expect(snapshot.runs[0]?.summary.cancelledInvoices).toBe(1);
   });
 
-  test("continua al paso 2 con ventas listas aunque otras ya esten en revision previa", async () => {
+  test("deja el paso 2 listo aunque otras ventas ya esten en revision previa", async () => {
     const saleReady = normalizeSale({
       externalId: "SALE-READY-1",
       issuedAt: "2026-03-24T11:00:00-05:00",
@@ -391,7 +478,8 @@ describe("AutomationCoordinator", () => {
     expect(
       runs[0]?.logs.some((log) => /ya estaban en revisión o enviadas a SUNAT/i.test(log.message)),
     ).toBe(true);
-    expect(runs[0]?.workflowStages[1]?.status).toBe("completed");
+    expect(runs[0]?.workflowStages[1]?.status).toBe("pending");
+    expect(snapshot.runtime.stepTwoReady.available).toBe(true);
     expect(snapshot.runtime.pendingApprovals).toHaveLength(0);
   });
 
