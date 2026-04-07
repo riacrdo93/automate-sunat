@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import {
   CheckCircle2,
   Circle,
@@ -15,6 +15,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "../ui/tabs";
 import { Button } from "../ui/button";
 import { HighlightedJson } from "../json-highlight";
 import { cn } from "../../lib/utils";
+import { useStickToBottomScroll } from "../../hooks/use-stick-to-bottom-scroll";
 import type {
   WorkflowStepView,
   WorkflowStatusView,
@@ -110,17 +111,7 @@ function LogConsole({
   maxHeightClass?: string;
   emptyMessage?: string;
 }) {
-  const scrollRef = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    const node = scrollRef.current;
-
-    if (!node) {
-      return;
-    }
-
-    node.scrollTop = node.scrollHeight;
-  }, [logs]);
+  const { ref: scrollRef, onScroll } = useStickToBottomScroll<HTMLDivElement>([logs]);
 
   if (logs.length === 0) {
     return (
@@ -140,7 +131,7 @@ function LogConsole({
 
   return (
     <div className="overflow-hidden rounded-md border border-border/30 bg-[#0a0a0a] font-mono text-[11px] leading-snug">
-      <div ref={scrollRef} className={cn("overflow-y-auto overflow-x-hidden", maxHeightClass)}>
+      <div ref={scrollRef} onScroll={onScroll} className={cn("overflow-y-auto overflow-x-hidden", maxHeightClass)}>
         {logs.map((log, index) => (
           <div key={index} className="flex items-start gap-2 border-b border-border/5 px-2 py-1 last:border-b-0">
             <span className="shrink-0 text-muted-foreground/30">{log.timestamp}</span>

@@ -1,8 +1,9 @@
 import { Card, Kbd, ScrollShadow } from "@heroui/react";
-import { useEffect, useMemo, useRef } from "react";
+import { useMemo } from "react";
 import type { DashboardRunRecord } from "@shared/dashboard-contract";
 import { describeLogContext, formatLogTime, labelForLogLevel, toneForStatus } from "../lib/dashboard";
 import { StatusChip } from "./status-chip";
+import { useStickToBottomScroll } from "../hooks/use-stick-to-bottom-scroll";
 
 type LogsDisclosureProps = {
   run: DashboardRunRecord;
@@ -10,22 +11,15 @@ type LogsDisclosureProps = {
 };
 
 export function LogsDisclosure({ run, selectedStageId }: LogsDisclosureProps) {
-  const scrollRef = useRef<HTMLDivElement | null>(null);
   const filteredLogs = useMemo(() => {
     const stageLogs = selectedStageId ? run.logs.filter((entry) => entry.stageId === selectedStageId) : run.logs;
 
     return stageLogs.length ? stageLogs : run.logs;
   }, [run.logs, selectedStageId]);
 
-  useEffect(() => {
-    const node = scrollRef.current;
-
-    if (!node) {
-      return;
-    }
-
-    node.scrollTop = node.scrollHeight;
-  }, [filteredLogs]);
+  const { ref: scrollRef, onScroll } = useStickToBottomScroll<HTMLDivElement>([filteredLogs], {
+    resetStickToBottomWhen: [selectedStageId ?? ""],
+  });
 
   return (
     <Card>
@@ -45,7 +39,7 @@ export function LogsDisclosure({ run, selectedStageId }: LogsDisclosureProps) {
       </Card.Header>
 
       <Card.Content className="p-0">
-        <ScrollShadow ref={scrollRef} className="max-h-[460px]" hideScrollBar size={32} visibility="both">
+        <ScrollShadow ref={scrollRef} onScroll={onScroll} className="max-h-[460px]" hideScrollBar size={32} visibility="both">
           <div className="space-y-3 px-5 py-5 font-mono text-[12px] leading-6 sm:px-6">
             {filteredLogs.length ? (
               filteredLogs.map((log, index) => {

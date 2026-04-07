@@ -609,6 +609,7 @@ export class SunatPortalEmitter implements InvoiceEmitter {
         draft.customer.name,
         customerDocumentField.scope,
         onStep,
+        { profile: this.profile, draft },
       );
 
       await onStep("Buscando el primer botón Continuar de la boleta.");
@@ -968,8 +969,21 @@ const FALABELLA_LOCAL_STORAGE_ENTRIES = [
   ],
 ] as const;
 
-/** Texto distintivo del modal de encuesta sobre la carga de documentos tributarios (Falabella Seller Center). */
+/** Título del modal de encuesta (texto del `<p>` en Seller Center). */
+const FALABELLA_DOCUMENT_UPLOAD_FEEDBACK_TITLE =
+  "Qué te parece la experiencia de carga de documentos tributarios?";
+
+/** Subcadena estable por si acortan o cambian el encabezado. */
 const FALABELLA_DOCUMENT_UPLOAD_FEEDBACK_MARKER = "experiencia de carga de documentos tributarios";
+
+const FALABELLA_DOCUMENT_UPLOAD_FEEDBACK_TEXT_MARKERS = [
+  FALABELLA_DOCUMENT_UPLOAD_FEEDBACK_TITLE,
+  FALABELLA_DOCUMENT_UPLOAD_FEEDBACK_MARKER,
+] as const;
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 async function launchBrowser(config: AppConfig): Promise<Browser> {
   return chromium.launch({
@@ -981,7 +995,8 @@ async function launchBrowser(config: AppConfig): Promise<Browser> {
 async function newFalabellaContext(browser: Browser): Promise<BrowserContext> {
   const context = await browser.newContext({ viewport: { width: 1600, height: 1000 } });
   await context.addInitScript((entries) => {
-    if (!window.location.hostname.includes("sellercenter.falabella.com")) {
+    const hn = window.location.hostname.toLowerCase();
+    if (!(hn.includes("sellercenter") && hn.includes("falabella"))) {
       return;
     }
 
@@ -990,12 +1005,56 @@ async function newFalabellaContext(browser: Browser): Promise<BrowserContext> {
     }
   }, FALABELLA_LOCAL_STORAGE_ENTRIES);
 
-  await context.addInitScript((marker) => {
-    if (typeof window === "undefined" || !window.location.hostname.includes("sellercenter.falabella.com")) {
+  await context.addInitScript((markers: readonly string[]) => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const hn = window.location.hostname.toLowerCase();
+    if (!(hn.includes("sellercenter") && hn.includes("falabella"))) {
       return;
     }
 
-    const normalizedMarker = String(marker).toLowerCase();
+    const installKey = "__automateSunatFalabellaFeedbackDismiss";
+    const winFlags = window as unknown as Record<string, unknown>;
+    if (winFlags[installKey]) {
+      return;
+    }
+    winFlags[installKey] = true;
+
+    try {
+      const style = document.createElement("style");
+      style.textContent = `
+        #survey-wrapper {
+          display: none !important;
+          visibility: hidden !important;
+          opacity: 0 !important;
+          pointer-events: none !important;
+          z-index: -9999 !important;
+        }
+      `;
+      document.head.appendChild(style);
+    } catch {
+      /* ignore */
+    }
+
+    function foldAccents(s: string): string {
+      try {
+        return s.normalize("NFD").replace(/\p{M}/gu, "");
+      } catch {
+        return s;
+      }
+    }
+
+    function haystackMatchesFeedbackModal(haystack: string): boolean {
+      const folded = foldAccents(haystack.toLowerCase());
+      for (let i = 0; i < markers.length; i++) {
+        const needle = foldAccents(String(markers[i]).toLowerCase());
+        if (needle.length > 0 && folded.includes(needle)) {
+          return true;
+        }
+      }
+      return false;
+    }
 
     function hideModalMaskForWrap(wrap: Element): void {
       const root = wrap.closest(".ant-modal-root");
@@ -1008,35 +1067,221 @@ async function newFalabellaContext(browser: Browser): Promise<BrowserContext> {
       }
     }
 
-    function dismissDocumentUploadFeedbackModal(): void {
+    function forceHideFeedbackEl(el: HTMLElement): void {
+      el.style.setProperty("display", "none", "important");
+      el.style.setProperty("visibility", "hidden", "important");
+      el.style.setProperty("pointer-events", "none", "important");
+      el.setAttribute("aria-hidden", "true");
+    }
+
+    function dispatchUiClick(el: HTMLElement): void {
+      el.click();
+      el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+    }
+
+    function normBtnLabel(el: Element): string {
+      return (el.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+    }
+
+    function tryDismissFeedbackInRoot(root: Element): boolean {
+      const text = root.textContent || "";
+      if (!haystackMatchesFeedbackModal(text)) {
+        return false;
+      }
+
+      const shell =
+        root instanceof HTMLElement
+          ? root.closest(".settlement-invoice-modal-wrap") ?? root
+          : null;
+      const clickRoot: Element =
+        root instanceof HTMLElement ? root.querySelector(".settlement-invoice-modal") ?? root : root;
+
+      const cancelPrimary = clickRoot.querySelector(
+        ".settlement-invoice-modal-footer .settlement-invoice-btn-default",
+      );
+      if (cancelPrimary instanceof HTMLElement) {
+        dispatchUiClick(cancelPrimary);
+      }
+
+      const footerCancel = clickRoot.querySelector(".settlement-invoice-modal-footer button");
+      if (
+        footerCancel instanceof HTMLElement &&
+        footerCancel !== cancelPrimary &&
+        normBtnLabel(footerCancel) === "cancelar"
+      ) {
+        dispatchUiClick(footerCancel);
+      }
+
+      const buttons = clickRoot.querySelectorAll("button");
+      for (let j = 0; j < buttons.length; j++) {
+        const btn = buttons[j];
+        if (!(btn instanceof HTMLElement)) {
+          continue;
+        }
+        const label = (btn.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+        if (label === "cancelar") {
+          dispatchUiClick(btn);
+          break;
+        }
+      }
+
+      const closeBtn = clickRoot.querySelector(
+        ".settlement-invoice-modal-close, button[aria-label='Close'], .ant-modal-close, .ant-modal-close-x",
+      );
+      if (closeBtn instanceof HTMLElement) {
+        dispatchUiClick(closeBtn);
+      }
+
+      if (shell instanceof HTMLElement) {
+        hideModalMaskForWrap(shell);
+        forceHideFeedbackEl(shell);
+        shell.remove();
+        return true;
+      }
+
+      if (root instanceof HTMLElement) {
+        hideModalMaskForWrap(root);
+        forceHideFeedbackEl(root);
+        root.remove();
+        return true;
+      }
+
+      return false;
+    }
+
+    function pickerPanelLooksVisible(el: HTMLElement): boolean {
+      const cs = window.getComputedStyle(el);
+      if (cs.display === "none" || cs.visibility === "hidden" || Number(cs.opacity) === 0) {
+        return false;
+      }
+      const r = el.getBoundingClientRect();
+      return r.width > 4 && r.height > 4;
+    }
+
+    function classNameOf(el: Element): string {
+      const cn = el.className;
+      return typeof cn === "string" ? cn : "";
+    }
+
+    /** true si el nodo está bajo el popup del selector de fechas (no el modal de encuesta). */
+    function isUnderDatePickerUi(el: Element | null): boolean {
+      for (let d = 0, c: Element | null = el; d < 28 && c; d += 1, c = c.parentElement) {
+        const cls = classNameOf(c);
+        if (
+          cls.includes("settlement-invoice-picker") ||
+          /\bant-picker\b/.test(cls) ||
+          cls.includes("ant-picker-dropdown") ||
+          cls.includes("ant-picker-panel")
+        ) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    function hostLooksLikeCalendarGrid(el: HTMLElement): boolean {
+      const cells =
+        el.querySelectorAll("td.settlement-invoice-picker-cell, td.ant-picker-cell, .settlement-invoice-picker-cell")
+          .length;
+      return cells >= 7;
+    }
+
+    function scheduleForceHidePicker(host: HTMLElement): void {
+      const outer =
+        host.closest(".ant-picker-dropdown") ??
+        host.closest("[class*='settlement-invoice-picker']") ??
+        host.closest(".ant-picker-panel-container") ??
+        host;
+
+      window.setTimeout(() => {
+        if (!pickerPanelLooksVisible(host)) {
+          return;
+        }
+        if (outer instanceof HTMLElement) {
+          forceHideFeedbackEl(outer);
+        }
+        window.setTimeout(() => {
+          if (pickerPanelLooksVisible(host) && outer instanceof HTMLElement) {
+            forceHideFeedbackEl(outer);
+          }
+        }, 400);
+      }, 200);
+    }
+
+    /** Cierra calendarios / rangos de fechas abiertos (Falabella usa variantes Ant; no siempre el mismo wrapper). */
+    function dismissStuckFalabellaDatePopups(): void {
       try {
-        const wraps = document.querySelectorAll(".ant-modal-wrap");
-        for (let i = 0; i < wraps.length; i++) {
-          const wrap = wraps[i];
-          const text = (wrap.textContent || "").toLowerCase();
-          if (!text.includes(normalizedMarker)) {
-            continue;
-          }
+        const candidateSelectors = [
+          ".settlement-invoice-picker-panel-container",
+          ".ant-picker-dropdown",
+          ".ant-picker-panel-container",
+          ".ant-picker-range-wrapper",
+        ];
 
-          const buttons = wrap.querySelectorAll("button");
-          for (let j = 0; j < buttons.length; j++) {
-            const label = (buttons[j].textContent || "").trim().toLowerCase();
-            if (label === "cancelar") {
-              buttons[j].click();
-              return;
-            }
+        const tryHost = (host: HTMLElement) => {
+          if (!pickerPanelLooksVisible(host)) {
+            return;
           }
-
-          const closeBtn = wrap.querySelector(".ant-modal-close, .ant-modal-close-x");
-          if (closeBtn instanceof HTMLElement) {
-            closeBtn.click();
+          const r = host.getBoundingClientRect();
+          if (r.width < 72 || r.height < 72) {
+            return;
+          }
+          if (!isUnderDatePickerUi(host) && !hostLooksLikeCalendarGrid(host)) {
             return;
           }
 
-          if (wrap instanceof HTMLElement) {
-            hideModalMaskForWrap(wrap);
-            wrap.style.display = "none";
-            wrap.style.pointerEvents = "none";
+          const footerBtnSelectors = [
+            ".settlement-invoice-picker-footer button",
+            ".ant-picker-footer button",
+            ".ant-picker-ranges button",
+            ".ant-picker-ok button",
+          ].join(", ");
+
+          const footerBtns = host.querySelectorAll(footerBtnSelectors);
+          for (let b = 0; b < footerBtns.length; b++) {
+            const btn = footerBtns[b];
+            if (!(btn instanceof HTMLElement)) {
+              continue;
+            }
+            if (!isUnderDatePickerUi(btn)) {
+              continue;
+            }
+            const lbl = normBtnLabel(btn);
+            if (lbl === "cerrar" || lbl === "ok" || lbl === "aceptar" || lbl === "aplicar") {
+              dispatchUiClick(btn);
+              break;
+            }
+          }
+
+          scheduleForceHidePicker(host);
+        };
+
+        for (let s = 0; s < candidateSelectors.length; s++) {
+          const nodes = document.querySelectorAll(candidateSelectors[s]);
+          for (let i = 0; i < nodes.length; i++) {
+            const h = nodes[i];
+            if (h instanceof HTMLElement) {
+              tryHost(h);
+            }
+          }
+        }
+
+        const allButtons = document.querySelectorAll("button");
+        for (let i = 0; i < allButtons.length; i++) {
+          const btn = allButtons[i];
+          if (!(btn instanceof HTMLElement) || !pickerPanelLooksVisible(btn)) {
+            continue;
+          }
+          if (normBtnLabel(btn) !== "cerrar") {
+            continue;
+          }
+          if (!isUnderDatePickerUi(btn)) {
+            continue;
+          }
+          dispatchUiClick(btn);
+          const lift = btn.closest(".ant-picker-dropdown") ?? btn.closest("[class*='settlement-invoice-picker']");
+          if (lift instanceof HTMLElement) {
+            scheduleForceHidePicker(lift);
           }
         }
       } catch {
@@ -1044,15 +1289,81 @@ async function newFalabellaContext(browser: Browser): Promise<BrowserContext> {
       }
     }
 
+    function dismissMedalliaSurveyWrapper(): void {
+      try {
+        const wrap = document.getElementById("survey-wrapper");
+        if (!(wrap instanceof HTMLElement)) {
+          return;
+        }
+
+        const form = wrap.querySelector("form.mediumSurvey");
+        const txt = foldAccents((wrap.textContent || "").toLowerCase());
+        if (!form && !txt.includes("falabella")) {
+          return;
+        }
+
+        const cerrar = wrap.querySelector(
+          'button[data-aut="button-close"], button.surveyBtn_close, button.surveyBtn.surveyBtn_close',
+        );
+        if (cerrar instanceof HTMLElement && normBtnLabel(cerrar) === "cerrar") {
+          dispatchUiClick(cerrar);
+        }
+
+        const xBtn = wrap.querySelector('button[data-aut="button-x-close"], button.surveyX, button[aria-label="Close Survey"]');
+        if (xBtn instanceof HTMLElement) {
+          dispatchUiClick(xBtn);
+        }
+
+        forceHideFeedbackEl(wrap);
+        wrap.remove();
+      } catch {
+        /* ignore */
+      }
+    }
+
+    function dismissDocumentUploadFeedbackModal(): void {
+      try {
+        const outerInvoiceWraps = document.querySelectorAll(".settlement-invoice-modal-wrap");
+        for (let w = 0; w < outerInvoiceWraps.length; w++) {
+          if (tryDismissFeedbackInRoot(outerInvoiceWraps[w])) {
+            return;
+          }
+        }
+
+        const wraps = document.querySelectorAll(".ant-modal-wrap");
+        for (let i = 0; i < wraps.length; i++) {
+          if (tryDismissFeedbackInRoot(wraps[i])) {
+            return;
+          }
+        }
+
+        const settlementModals = document.querySelectorAll(".settlement-invoice-modal");
+        for (let k = 0; k < settlementModals.length; k++) {
+          if (tryDismissFeedbackInRoot(settlementModals[k])) {
+            return;
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+
+    function dismissFalabellaBlockingOverlays(): void {
+      dismissDocumentUploadFeedbackModal();
+      dismissMedalliaSurveyWrapper();
+      dismissStuckFalabellaDatePopups();
+    }
+
     function attachObserver(): void {
       if (!document.body) {
         return;
       }
       const observer = new MutationObserver(() => {
-        dismissDocumentUploadFeedbackModal();
+        dismissFalabellaBlockingOverlays();
       });
       observer.observe(document.body, { childList: true, subtree: true });
-      dismissDocumentUploadFeedbackModal();
+      dismissFalabellaBlockingOverlays();
+      window.setInterval(dismissFalabellaBlockingOverlays, 2_000);
     }
 
     if (document.readyState === "loading") {
@@ -1060,7 +1371,7 @@ async function newFalabellaContext(browser: Browser): Promise<BrowserContext> {
     } else {
       attachObserver();
     }
-  }, FALABELLA_DOCUMENT_UPLOAD_FEEDBACK_MARKER);
+  }, FALABELLA_DOCUMENT_UPLOAD_FEEDBACK_TEXT_MARKERS);
 
   return context;
 }
@@ -1220,18 +1531,390 @@ type FalabellaPaginationState = {
   nextPage?: number;
 };
 
-async function collectFalabellaPendingRowsAcrossPages(
-  page: Page,
-  onStep: StepReporter,
-): Promise<FalabellaRowCandidate[]> {
-  const initialState = await waitForFalabellaDocumentsReadyState(page, onStep);
-  if (initialState === "empty") {
-    await onStep("Documentos tributarios: la bandeja cargó sin órdenes pendientes.");
-    return [];
+function getFalabellaTodayLocalIso(): string {
+  const t = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${t.getFullYear()}-${pad(t.getMonth() + 1)}-${pad(t.getDate())}`;
+}
+
+/**
+ * Ventanas de 30 días corridos inclusivos (inicio + 29), encadenadas con el último día del bloque
+ * anterior como primer día del siguiente (p. ej. 1–30 ene, 30 ene–28 feb, 28 feb–29 mar).
+ * El filtro en Falabella sigue partiéndose por mes calendario dentro de cada ventana.
+ */
+const FALABELLA_DOCUMENTS_DATE_CHUNK_DAYS = 30;
+
+function parseFalabellaLocalIsoDate(iso: string): { y: number; m: number; d: number } {
+  const parts = iso.split("-").map((p) => parseInt(p, 10));
+  if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) {
+    throw new Error(`Falabella documentos: fecha ISO inválida "${iso}".`);
+  }
+  const [y, m, d] = parts;
+  return { y, m, d };
+}
+
+function formatFalabellaLocalIsoDate(y: number, m: number, d: number): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${y}-${pad(m)}-${pad(d)}`;
+}
+
+function falabellaIsoSameCalendarMonth(isoA: string, isoB: string): boolean {
+  const a = parseFalabellaLocalIsoDate(isoA);
+  const b = parseFalabellaLocalIsoDate(isoB);
+  return a.y === b.y && a.m === b.m;
+}
+
+function addCalendarDaysToFalabellaIsoLocal(iso: string, deltaDays: number): string {
+  const { y, m, d } = parseFalabellaLocalIsoDate(iso);
+  const dt = new Date(y, m - 1, d);
+  dt.setDate(dt.getDate() + deltaDays);
+  return formatFalabellaLocalIsoDate(dt.getFullYear(), dt.getMonth() + 1, dt.getDate());
+}
+
+/** Último día del mes local; `m` es 1–12. */
+function falabellaEndOfCalendarMonthIso(y: number, m: number): string {
+  const last = new Date(y, m, 0);
+  return formatFalabellaLocalIsoDate(last.getFullYear(), last.getMonth() + 1, last.getDate());
+}
+
+/**
+ * Parte [rangeStart, rangeEnd] en intervalos dentro de un solo mes (fin de mes como tope).
+ * Recorre el mismo conjunto de días que el rango original, sin solapamientos.
+ */
+function* subdivideFalabellaIsoRangeByCalendarMonth(
+  rangeStartIso: string,
+  rangeEndIso: string,
+): Generator<{ start: string; end: string }> {
+  if (rangeStartIso.localeCompare(rangeEndIso) > 0) {
+    return;
   }
 
+  let cursor = rangeStartIso;
+  while (cursor.localeCompare(rangeEndIso) <= 0) {
+    const { y, m } = parseFalabellaLocalIsoDate(cursor);
+    const monthLast = falabellaEndOfCalendarMonthIso(y, m);
+    const segmentEnd = monthLast.localeCompare(rangeEndIso) <= 0 ? monthLast : rangeEndIso;
+    yield { start: cursor, end: segmentEnd };
+    cursor = addCalendarDaysToFalabellaIsoLocal(segmentEnd, 1);
+  }
+}
+
+function* iterateFalabellaDateChunksFromYearStart(
+  year: number,
+  todayIso: string,
+): Generator<{ start: string; end: string }> {
+  let chunkStart = formatFalabellaLocalIsoDate(year, 1, 1);
+  if (chunkStart.localeCompare(todayIso) > 0) {
+    return;
+  }
+
+  while (chunkStart.localeCompare(todayIso) <= 0) {
+    const chunkEndInclusive = addCalendarDaysToFalabellaIsoLocal(
+      chunkStart,
+      FALABELLA_DOCUMENTS_DATE_CHUNK_DAYS - 1,
+    );
+    const end = chunkEndInclusive.localeCompare(todayIso) > 0 ? todayIso : chunkEndInclusive;
+    yield { start: chunkStart, end };
+    if (end.localeCompare(todayIso) >= 0) {
+      return;
+    }
+    chunkStart = end;
+  }
+}
+
+type FalabellaDatePickerFlavor = "settlement" | "ant";
+
+function falabellaMonthLabelToNumber(raw: string): number | undefined {
+  const t = raw.trim().toLowerCase().replace(/\./g, "");
+  const fullEs: Record<string, number> = {
+    enero: 1,
+    febrero: 2,
+    marzo: 3,
+    abril: 4,
+    mayo: 5,
+    junio: 6,
+    julio: 7,
+    agosto: 8,
+    septiembre: 9,
+    setiembre: 9,
+    octubre: 10,
+    noviembre: 11,
+    diciembre: 12,
+  };
+  if (fullEs[t] !== undefined) {
+    return fullEs[t];
+  }
+  const k3 = t.slice(0, 3);
+  const abbrevs: Record<string, number> = {
+    ene: 1,
+    feb: 2,
+    mar: 3,
+    abr: 4,
+    may: 5,
+    jun: 6,
+    jul: 7,
+    ago: 8,
+    sep: 9,
+    oct: 10,
+    nov: 11,
+    dic: 12,
+    jan: 1,
+    apr: 4,
+    aug: 8,
+    dec: 12,
+  };
+  return abbrevs[k3];
+}
+
+async function readSettlementPickerPanelYearMonth(panel: Locator): Promise<{ y: number; m: number } | null> {
+  const monthRaw = await panel
+    .locator(".settlement-invoice-picker-month-btn")
+    .first()
+    .textContent()
+    .catch(() => null);
+  const yearRaw = await panel
+    .locator(".settlement-invoice-picker-year-btn")
+    .first()
+    .textContent()
+    .catch(() => null);
+  if (!monthRaw?.trim() || !yearRaw?.trim()) {
+    return null;
+  }
+  const digits = String(yearRaw).replace(/\D/g, "");
+  const y = parseInt(digits, 10);
+  const m = falabellaMonthLabelToNumber(monthRaw);
+  if (!Number.isFinite(y) || m === undefined) {
+    return null;
+  }
+  return { y, m };
+}
+
+/**
+ * El range picker de Falabella suele abrirse en «hoy» (p. ej. abril); hay que llevar el panel
+ * izquierdo o derecho explícitamente al mes del `targetIso` antes de cliquear el día.
+ */
+async function ensureSettlementPickerPanelShowsYearMonth(
+  page: Page,
+  panel: Locator,
+  targetYear: number,
+  targetMonth: number,
+): Promise<void> {
+  const prev = panel
+    .locator("button.settlement-invoice-picker-header-prev-btn")
+    .filter({ visible: true })
+    .first();
+  const next = panel
+    .locator("button.settlement-invoice-picker-header-next-btn")
+    .filter({ visible: true })
+    .first();
+
+  for (let i = 0; i < 48; i += 1) {
+    const cur = await readSettlementPickerPanelYearMonth(panel);
+    if (!cur) {
+      await page.waitForTimeout(150);
+      continue;
+    }
+    if (cur.y === targetYear && cur.m === targetMonth) {
+      return;
+    }
+    const curOrd = cur.y * 12 + cur.m;
+    const tgtOrd = targetYear * 12 + targetMonth;
+    if (curOrd > tgtOrd) {
+      await prev.click({ timeout: 5_000 }).catch(() => undefined);
+    } else {
+      await next.click({ timeout: 5_000 }).catch(() => undefined);
+    }
+    await page.waitForTimeout(180);
+  }
+
+  throw new Error(
+    `Falabella documentos: no pude alinear el calendario settlement al mes ${targetYear}-${String(targetMonth).padStart(2, "0")}.`,
+  );
+}
+
+async function waitForFalabellaDatePickerRoot(page: Page): Promise<{
+  root: Locator;
+  flavor: FalabellaDatePickerFlavor;
+}> {
+  const settlement = page.locator(".settlement-invoice-picker-panel-container").first();
+  try {
+    await settlement.waitFor({ state: "visible", timeout: 15_000 });
+    return { root: settlement, flavor: "settlement" };
+  } catch {
+    const ant = page.locator(".ant-picker-dropdown").filter({ has: page.locator(".ant-picker-panel") }).first();
+    await ant.waitFor({ state: "visible", timeout: 10_000 });
+    return { root: ant, flavor: "ant" };
+  }
+}
+
+async function pickFalabellaDatePickerDayWithPanelNavigation(
+  page: Page,
+  root: Locator,
+  panel: Locator,
+  targetIso: string,
+  flavor: FalabellaDatePickerFlavor,
+): Promise<void> {
+  /** En settlement el panel derecho puede ser el mes siguiente; las fechas del mes izquierdo solo son clicables ahí. */
+  const cellLocator =
+    flavor === "settlement"
+      ? panel.locator(
+          `td.settlement-invoice-picker-cell[title="${targetIso}"]:not(.settlement-invoice-picker-cell-disabled)`,
+        )
+      : root.locator(`td.ant-picker-cell[title="${targetIso}"]:not(.ant-picker-cell-disabled)`);
+
+  const probeLocator =
+    flavor === "settlement"
+      ? panel.locator("td.settlement-invoice-picker-cell-in-view[title]")
+      : panel.locator("td.ant-picker-cell-in-view[title]");
+
+  const prev =
+    flavor === "settlement"
+      ? panel
+          .locator("button.settlement-invoice-picker-header-prev-btn")
+          .filter({ visible: true })
+          .first()
+      : panel
+          .locator(".ant-picker-header-prev-btn")
+          .or(panel.locator("button").filter({ has: page.locator(".ant-picker-prev-icon") }))
+          .first();
+
+  const next =
+    flavor === "settlement"
+      ? panel
+          .locator("button.settlement-invoice-picker-header-next-btn")
+          .filter({ visible: true })
+          .first()
+      : panel
+          .locator(".ant-picker-header-next-btn")
+          .or(panel.locator("button").filter({ has: page.locator(".ant-picker-next-icon") }))
+          .first();
+
+  const { y: targetYear, m: targetMonth } = parseFalabellaLocalIsoDate(targetIso);
+
+  async function tryClickTargetCell(): Promise<boolean> {
+    const handle = cellLocator.first();
+    if ((await handle.count().catch(() => 0)) === 0) {
+      return false;
+    }
+    if (!(await handle.isVisible().catch(() => false))) {
+      return false;
+    }
+    await handle.scrollIntoViewIfNeeded().catch(() => undefined);
+    await handle.click({ timeout: 5_000 });
+    return true;
+  }
+
+  if (flavor === "settlement") {
+    await ensureSettlementPickerPanelShowsYearMonth(page, panel, targetYear, targetMonth);
+    for (let attempt = 0; attempt < 28; attempt += 1) {
+      if (await tryClickTargetCell()) {
+        return;
+      }
+      await ensureSettlementPickerPanelShowsYearMonth(page, panel, targetYear, targetMonth);
+      await page.waitForTimeout(120);
+    }
+    throw new Error(`Falabella documentos: no pude seleccionar el día ${targetIso} (settlement picker).`);
+  }
+
+  for (let attempt = 0; attempt < 48; attempt += 1) {
+    if (await tryClickTargetCell()) {
+      return;
+    }
+
+    const probe = probeLocator.nth(8);
+    const probeTitle = await probe.getAttribute("title").catch(() => null);
+    if (!probeTitle) {
+      await prev.click({ timeout: 5_000 }).catch(() => undefined);
+      await page.waitForTimeout(150);
+      continue;
+    }
+
+    if (probeTitle.localeCompare(targetIso) < 0) {
+      await next.click({ timeout: 5_000 }).catch(() => undefined);
+    } else {
+      await prev.click({ timeout: 5_000 }).catch(() => undefined);
+    }
+    await page.waitForTimeout(150);
+  }
+
+  throw new Error(`Falabella documentos: no pude seleccionar el día ${targetIso} (picker ${flavor}).`);
+}
+
+async function closeFalabellaDatePicker(
+  page: Page,
+  root: Locator,
+  flavor: FalabellaDatePickerFlavor,
+): Promise<void> {
+  if (flavor === "settlement") {
+    const close = root.locator(".settlement-invoice-picker-footer").getByRole("button", { name: /^Cerrar$/ });
+    if (await close.isVisible().catch(() => false)) {
+      await close.click({ timeout: 5_000 }).catch(() => undefined);
+      await page.waitForTimeout(200);
+      if (!(await root.isVisible().catch(() => false))) {
+        return;
+      }
+    }
+  } else {
+    const ok = page.locator(".ant-picker-dropdown .ant-picker-ok button").first();
+    if (await ok.isVisible().catch(() => false)) {
+      await ok.click({ timeout: 5_000 }).catch(() => undefined);
+      await page.waitForTimeout(200);
+      return;
+    }
+  }
+
+  await page.keyboard.press("Escape").catch(() => undefined);
+  await page.waitForTimeout(200);
+}
+
+async function applyFalabellaDocumentsDateFilterRange(
+  page: Page,
+  onStep: StepReporter,
+  startIso: string,
+  endIso: string,
+): Promise<void> {
+  await dismissFalabellaSellerBlockingSurveys(page, onStep);
+
+  await onStep(`Falabella documentos: filtro de fechas ${startIso} → ${endIso} (date-filter-input-id).`);
+
+  const input = page.getByTestId("date-filter-input-id");
+  await input.waitFor({ state: "visible", timeout: 20_000 });
+  await input.scrollIntoViewIfNeeded().catch(() => undefined);
+  await input.click({ timeout: 10_000 });
+
+  const { root, flavor } = await waitForFalabellaDatePickerRoot(page);
+
+  const panels =
+    flavor === "settlement" ? root.locator(".settlement-invoice-picker-panel") : root.locator(".ant-picker-panel");
+  const panelCount = await panels.count().catch(() => 0);
+  const startPanel = panelCount > 0 ? panels.first() : root;
+
+  await pickFalabellaDatePickerDayWithPanelNavigation(page, root, startPanel, startIso, flavor);
+
+  await page.waitForTimeout(400);
+
+  const pickerStillOpen = await root.isVisible().catch(() => false);
+  if (pickerStillOpen) {
+    await onStep(
+      endIso === startIso
+        ? `Falabella documentos: confirmo fin de rango el mismo día ${endIso}.`
+        : `Falabella documentos: elijo fin de rango ${endIso}.`,
+    );
+    const endPanel =
+      panelCount > 1 && !falabellaIsoSameCalendarMonth(startIso, endIso) ? panels.nth(1) : startPanel;
+    await pickFalabellaDatePickerDayWithPanelNavigation(page, root, endPanel, endIso, flavor);
+  }
+
+  await closeFalabellaDatePicker(page, root, flavor);
+  await onStep("Falabella documentos: filtro aplicado; esperando actualización de la bandeja.");
+}
+
+async function collectFalabellaPendingRowsAcrossPagesWithAccumulation(
+  page: Page,
+  onStep: StepReporter,
+  collected: Map<string, FalabellaRowCandidate>,
+): Promise<number> {
   await ensureFalabellaDocumentsStartFromFirstPage(page, onStep);
-  const collected = new Map<string, FalabellaRowCandidate>();
   const visitedPageStates = new Set<string>();
   let visitedPages = 0;
 
@@ -1277,8 +1960,73 @@ async function collectFalabellaPendingRowsAcrossPages(
     await goToNextFalabellaDocumentsPage(page, pagination.currentPage, pageState, onStep);
   }
 
+  return visitedPages;
+}
+
+async function collectFalabellaPendingRowsAcrossPages(
+  page: Page,
+  onStep: StepReporter,
+): Promise<FalabellaRowCandidate[]> {
+  let ready = await waitForFalabellaDocumentsReadyState(page, onStep);
+  if (ready === "timeout") {
+    throw new Error(
+      "Falabella documentos: la vista no quedó lista antes de aplicar el filtro de fechas (tabla o vacío reconocible).",
+    );
+  }
+
+  const year = new Date().getFullYear();
+  const todayIso = getFalabellaTodayLocalIso();
+  const collected = new Map<string, FalabellaRowCandidate>();
+  let totalVisitedPages = 0;
+  let chunkIndex = 0;
+
+  for (const { start, end } of iterateFalabellaDateChunksFromYearStart(year, todayIso)) {
+    chunkIndex += 1;
+    await onStep(
+      `Documentos tributarios: bloque ${chunkIndex} (${start}–${end}): ${FALABELLA_DOCUMENTS_DATE_CHUNK_DAYS} días corridos; en el filtro lo parto por mes calendario.`,
+    );
+
+    let visitedInChunk = 0;
+    let partIndex = 0;
+    for (const { start: segStart, end: segEnd } of subdivideFalabellaIsoRangeByCalendarMonth(start, end)) {
+      partIndex += 1;
+      await applyFalabellaDocumentsDateFilterRange(page, onStep, segStart, segEnd);
+
+      ready = await waitForFalabellaDocumentsReadyState(page, onStep);
+      if (ready === "timeout") {
+        throw new Error(
+          `Falabella documentos: tras el filtro ${segStart}–${segEnd} (bloque ${chunkIndex} · parte ${partIndex}) la vista no volvió a mostrar tabla ni estado vacío a tiempo.`,
+        );
+      }
+
+      if (ready === "empty") {
+        await onStep(
+          `Documentos tributarios: bloque ${chunkIndex} parte ${partIndex} (${segStart}–${segEnd}): vacía; siguiente parte.`,
+        );
+        continue;
+      }
+
+      await onStep(
+        `Documentos tributarios: bloque ${chunkIndex} parte ${partIndex} (${segStart}–${segEnd}): pagino y acumulo (únicas: ${collected.size}).`,
+      );
+      visitedInChunk += await collectFalabellaPendingRowsAcrossPagesWithAccumulation(page, onStep, collected);
+    }
+
+    totalVisitedPages += visitedInChunk;
+    await onStep(
+      `Documentos tributarios: bloque ${chunkIndex} cerrado — ${visitedInChunk} página(s); acumulado ${collected.size} orden(es).`,
+    );
+  }
+
+  if (collected.size === 0) {
+    await onStep(
+      "Documentos tributarios: barridos de ~30 días desde el 1 de enero hasta hoy — sin órdenes con documento pendiente.",
+    );
+    return [];
+  }
+
   await onStep(
-    `Documentos tributarios: revisé ${visitedPages} página(s) y encontré ${collected.size} orden(es) con documento pendiente.`,
+    `Documentos tributarios: ${collected.size} orden(es) con documento pendiente (${totalVisitedPages} páginas entre todos los tramos).`,
   );
   return Array.from(collected.values());
 }
@@ -1288,42 +2036,75 @@ async function findFalabellaPendingRowByOrderIdAcrossPages(
   orderId: string,
   onStep: StepReporter,
 ): Promise<FalabellaRowCandidate | undefined> {
-  const initialState = await waitForFalabellaDocumentsReadyState(page, onStep);
-  if (initialState === "empty") {
-    await onStep("Documentos tributarios: la bandeja cargó sin órdenes pendientes.");
-    return undefined;
-  }
-
-  await ensureFalabellaDocumentsStartFromFirstPage(page, onStep);
-  const visitedPageStates = new Set<string>();
-
-  while (true) {
-    await waitForFalabellaDocumentsRows(page, 30_000, onStep);
-    const pagination = await readFalabellaPaginationState(page);
-    const pageState = await buildFalabellaPageStateKey(page, pagination.currentPage);
-
-    if (visitedPageStates.has(pageState)) {
-      return undefined;
-    }
-
-    visitedPageStates.add(pageState);
-    await onStep(
-      pagination.totalPages > 1
-        ? `Documentos tributarios: buscando la orden ${orderId} en la página ${pagination.currentPage} de ${pagination.totalPages}.`
-        : `Documentos tributarios: buscando la orden ${orderId} en la página disponible.`,
+  let ready = await waitForFalabellaDocumentsReadyState(page, onStep);
+  if (ready === "timeout") {
+    throw new Error(
+      "Falabella documentos: la vista no quedó lista antes de aplicar el filtro de fechas (tabla o vacío reconocible).",
     );
-
-    const row = await findFalabellaOrderRowByOrderId(page, orderId);
-    if (row) {
-      return extractEnabledFalabellaRow(row, orderId);
-    }
-
-    if (!pagination.hasNextPage) {
-      return undefined;
-    }
-
-    await goToNextFalabellaDocumentsPage(page, pagination.currentPage, pageState, onStep);
   }
+
+  const year = new Date().getFullYear();
+  const todayIso = getFalabellaTodayLocalIso();
+  let chunkIndex = 0;
+
+  for (const { start, end } of iterateFalabellaDateChunksFromYearStart(year, todayIso)) {
+    chunkIndex += 1;
+    let partIndex = 0;
+    for (const { start: segStart, end: segEnd } of subdivideFalabellaIsoRangeByCalendarMonth(start, end)) {
+      partIndex += 1;
+      await applyFalabellaDocumentsDateFilterRange(page, onStep, segStart, segEnd);
+
+      ready = await waitForFalabellaDocumentsReadyState(page, onStep);
+      if (ready === "timeout") {
+        throw new Error(
+          `Falabella documentos: tras el filtro ${segStart}–${segEnd} (bloque ${chunkIndex} · parte ${partIndex}) la vista no volvió a mostrar tabla ni estado vacío a tiempo.`,
+        );
+      }
+
+      if (ready === "empty") {
+        await onStep(
+          `Documentos tributarios: bloque ${chunkIndex} parte ${partIndex} (${segStart}–${segEnd}): vacío; sigo buscando ${orderId}.`,
+        );
+        continue;
+      }
+
+      await ensureFalabellaDocumentsStartFromFirstPage(page, onStep);
+      const visitedPageStates = new Set<string>();
+
+      while (true) {
+        await waitForFalabellaDocumentsRows(page, 30_000, onStep);
+        const pagination = await readFalabellaPaginationState(page);
+        const pageState = await buildFalabellaPageStateKey(page, pagination.currentPage);
+
+        if (visitedPageStates.has(pageState)) {
+          break;
+        }
+
+        visitedPageStates.add(pageState);
+        await onStep(
+          pagination.totalPages > 1
+            ? `Documentos tributarios: bloque ${chunkIndex} parte ${partIndex} (${segStart}–${segEnd}) — busco ${orderId} en pág. ${pagination.currentPage} de ${pagination.totalPages}.`
+            : `Documentos tributarios: bloque ${chunkIndex} parte ${partIndex} (${segStart}–${segEnd}) — busco ${orderId} en la página disponible.`,
+        );
+
+        const row = await findFalabellaOrderRowByOrderId(page, orderId);
+        if (row) {
+          return extractEnabledFalabellaRow(row, orderId);
+        }
+
+        if (!pagination.hasNextPage) {
+          break;
+        }
+
+        await goToNextFalabellaDocumentsPage(page, pagination.currentPage, pageState, onStep);
+      }
+    }
+  }
+
+  await onStep(
+    `Documentos tributarios: la orden ${orderId} no apareció en tramos de ~30 días desde el 1 de enero hasta hoy.`,
+  );
+  return undefined;
 }
 
 async function collectFalabellaPendingRowsFromCurrentPage(
@@ -1399,21 +2180,81 @@ async function waitForFalabellaPostLogin(page: Page, timeoutMs = 20_000): Promis
   ]);
 }
 
-async function dismissFalabellaDocumentUploadFeedbackModal(page: Page, onStep?: StepReporter): Promise<void> {
-  const feedbackWrap = page
-    .locator(".ant-modal-wrap")
-    .filter({ hasText: new RegExp(FALABELLA_DOCUMENT_UPLOAD_FEEDBACK_MARKER, "i") })
-    .first();
-
-  if (!(await feedbackWrap.isVisible().catch(() => false))) {
+async function dismissFalabellaMedalliaSurveyWrapper(page: Page, onStep?: StepReporter): Promise<void> {
+  const wrap = page.locator("#survey-wrapper").first();
+  if (!(await wrap.isVisible().catch(() => false))) {
     return;
   }
 
-  await onStep?.(
-    "Falabella: encontré el modal de feedback sobre la experiencia de carga de documentos tributarios.",
+  const looksLikeFalabella =
+    (await wrap.locator("form.mediumSurvey").count().catch(() => 0)) > 0 ||
+    (await wrap.getByText(/falabella/i).count().catch(() => 0)) > 0;
+  if (!looksLikeFalabella) {
+    return;
+  }
+
+  await onStep?.("Falabella: encuesta NPS (Medallia, #survey-wrapper) visible; cierro con Cerrar o X.");
+
+  const cerrar = wrap.locator('[data-aut="button-close"], button.surveyBtn_close').first();
+  if (await cerrar.isVisible().catch(() => false)) {
+    await cerrar.click({ noWaitAfter: true }).catch(() => undefined);
+    await page.waitForTimeout(200);
+    await onStep?.("Falabella: encuesta NPS cerrada (Cerrar).");
+    return;
+  }
+
+  const closeX = wrap
+    .locator(
+      '[data-aut="button-x-close"], button.surveyX, button[aria-label="Close Survey"], button[aria-label="Cerrar"]',
+    )
+    .first();
+  if (await closeX.isVisible().catch(() => false)) {
+    await closeX.click({ noWaitAfter: true }).catch(() => undefined);
+    await page.waitForTimeout(200);
+    await onStep?.("Falabella: encuesta NPS cerrada (X).");
+  }
+}
+
+async function dismissFalabellaSellerBlockingSurveys(page: Page, onStep?: StepReporter): Promise<void> {
+  await dismissFalabellaDocumentUploadFeedbackModal(page, onStep);
+  await dismissFalabellaMedalliaSurveyWrapper(page, onStep);
+}
+
+async function dismissFalabellaDocumentUploadFeedbackModal(page: Page, onStep?: StepReporter): Promise<void> {
+  const textRe = new RegExp(
+    `${escapeRegExp(FALABELLA_DOCUMENT_UPLOAD_FEEDBACK_TITLE)}|${escapeRegExp(FALABELLA_DOCUMENT_UPLOAD_FEEDBACK_MARKER)}`,
+    "i",
   );
 
-  const cancel = feedbackWrap.getByRole("button", { name: /^cancelar$/i }).first();
+  const settlementOuter = page.locator(".settlement-invoice-modal-wrap").filter({ hasText: textRe }).first();
+  const settlementModal = page.locator(".settlement-invoice-modal").filter({ hasText: textRe }).first();
+  const feedbackWrap = page.locator(".ant-modal-wrap").filter({ hasText: textRe }).first();
+
+  const outerVisible = await settlementOuter.isVisible().catch(() => false);
+  const modalVisible = await settlementModal.isVisible().catch(() => false);
+  const settlementVisible = outerVisible || modalVisible;
+  const settlementScope = outerVisible ? settlementOuter : settlementModal;
+  const wrapVisible = await feedbackWrap.isVisible().catch(() => false);
+
+  if (!settlementVisible && !wrapVisible) {
+    return;
+  }
+
+  const scope = settlementVisible ? settlementScope : feedbackWrap;
+
+  await onStep?.(
+    "Falabella: encontré el modal de feedback (título de experiencia de carga de documentos tributarios).",
+  );
+
+  const cancelOutlined = scope.locator(".settlement-invoice-modal-footer .settlement-invoice-btn-default").first();
+  if (await cancelOutlined.isVisible().catch(() => false)) {
+    await cancelOutlined.click({ noWaitAfter: true }).catch(() => undefined);
+    await page.waitForTimeout(250);
+    await onStep?.("Falabella: modal de feedback de documentos tributarios cerrado (Cancelar).");
+    return;
+  }
+
+  const cancel = scope.getByRole("button", { name: /^cancelar$/i }).first();
   if (await cancel.isVisible().catch(() => false)) {
     await cancel.click({ noWaitAfter: true }).catch(() => undefined);
     await page.waitForTimeout(250);
@@ -1421,7 +2262,9 @@ async function dismissFalabellaDocumentUploadFeedbackModal(page: Page, onStep?: 
     return;
   }
 
-  const closeBtn = feedbackWrap.locator(".ant-modal-close, .ant-modal-close-x").first();
+  const closeBtn = settlementVisible
+    ? scope.locator(".settlement-invoice-modal-close, button[aria-label='Close']").first()
+    : scope.locator(".ant-modal-close, .ant-modal-close-x").first();
   if (await closeBtn.isVisible().catch(() => false)) {
     await closeBtn.click({ noWaitAfter: true }).catch(() => undefined);
     await page.waitForTimeout(250);
@@ -2942,14 +3785,48 @@ async function waitForAutofilledCustomerName(
   expectedName: string,
   preferredScope?: PageScope,
   onStep?: StepReporter,
+  sunatInconsistentDniRecovery?: { profile: SiteProfile; draft: InvoiceDraft },
 ): Promise<{ scope: PageScope; locator: Locator }> {
-  const field = await waitForAnyVisibleLocatorInPageTree(page, selectors, 30_000, preferredScope);
+  let field = await waitForAnyVisibleLocatorInPageTree(page, selectors, 30_000, preferredScope);
   const deadline = Date.now() + 20_000;
   const expected = normalizeComparableText(expectedName);
   const fieldIdentity = await describeLocatorIdentity(field.locator);
   let nextProgressLogAt = Date.now();
+  let nextModalAbsentLogAt = Date.now() + 6_000;
+
+  if (sunatInconsistentDniRecovery) {
+    const rawDoc = sunatInconsistentDniRecovery.draft.customer.documentNumber || "";
+    await onStep?.(
+      `SUNAT: esperando el nombre del cliente en ${fieldIdentity}. Si SUNAT muestra el modal «documento de identidad inconsistente», lo cierro, pongo tipo Sin documento y escribo el nombre del draft (${truncateForLog(rawDoc, 24)}).`,
+    );
+  }
 
   while (Date.now() < deadline) {
+    if (sunatInconsistentDniRecovery) {
+      const recovered = await tryRecoverSunatInconsistentIdentityModal(
+        page,
+        sunatInconsistentDniRecovery.profile,
+        sunatInconsistentDniRecovery.draft,
+        onStep,
+      );
+      if (recovered) {
+        const refreshed = await tryWaitForAnyVisibleLocatorInPageTree(
+          page,
+          selectors,
+          5_000,
+          preferredScope,
+        );
+        if (refreshed) {
+          field = refreshed;
+        }
+      } else if (Date.now() >= nextModalAbsentLogAt) {
+        await onStep?.(
+          "SUNAT modal inconsistencia: nombre aún vacío y no veo ese aviso en ningún marco; sigo esperando autocompletado o el modal.",
+        );
+        nextModalAbsentLogAt = Date.now() + 6_000;
+      }
+    }
+
     const value = await readLocatorValue(field.locator);
     const normalizedValue = normalizeComparableText(value);
 
@@ -2976,9 +3853,559 @@ async function waitForAutofilledCustomerName(
     await page.waitForTimeout(250);
   }
 
+  const docHint =
+    sunatInconsistentDniRecovery?.draft.customer.documentNumber !== undefined
+      ? ` Cliente: ${truncateForLog(sunatInconsistentDniRecovery.draft.customer.documentNumber, 32)} (${sunatInconsistentDniRecovery.draft.customer.documentNumber.replace(/\D+/g, "").length} dígitos).`
+      : "";
   throw new Error(
-    `SUNAT no cargó el nombre del cliente para el documento ${expectedName || "sin nombre esperado"}.`,
+    `SUNAT no cargó el nombre del cliente (nombre esperado: ${expectedName || "sin nombre esperado"}).${docHint}`,
   );
+}
+
+/** Texto del modal cuando SUNAT no encuentra o no valida el documento del cliente (flujo boleta). */
+const SUNAT_INCONSISTENT_IDENTITY_MODAL_RE = /documento\s+de\s+identidad\s+inconsistente/i;
+
+/** Texto visible del combo + `input[type=hidden][name=tipoDocumento]` para el código (p. ej. value 1 = DNI); no siempre hay `<select>`. */
+const SUNAT_INICIO_TIPO_DOCUMENTO_ID_XPATH = 'xpath=//*[@id="inicio.tipoDocumento"]';
+
+async function resolveSunatInicioTipoDocumentoControls(
+  page: Page,
+  timeoutMs: number,
+  onStep?: StepReporter,
+): Promise<{ fieldLoc: Locator; widgetLoc: Locator }> {
+  const widgetSelector = "#widget_inicio\\.tipoDocumento";
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    for (const scope of collectPageScopes(page)) {
+      const fieldLoc = scope.locator(SUNAT_INICIO_TIPO_DOCUMENTO_ID_XPATH).first();
+      const widgetLoc = scope.locator(widgetSelector).first();
+      const hasField = (await fieldLoc.count().catch(() => 0)) > 0;
+      const widgetVisible = await widgetLoc.isVisible().catch(() => false);
+
+      if (hasField || widgetVisible) {
+        const tagHint = hasField
+          ? await fieldLoc.evaluate((el: Element) => el.tagName.toLowerCase()).catch(() => "?")
+          : "—";
+        await onStep?.(
+          `SUNAT: control id=inicio.tipoDocumento (${hasField ? `en DOM, etiqueta <${tagHint}>` : "aún no en DOM"}, widget #widget_inicio.tipoDocumento ${widgetVisible ? "visible" : "no visible"} en ${describePageScopeForLog(scope)}).`,
+        );
+        return { fieldLoc, widgetLoc };
+      }
+    }
+    await page.waitForTimeout(200);
+  }
+
+  throw new Error(
+    'Tras cerrar el modal no apareció el control id="inicio.tipoDocumento" ni el widget #widget_inicio.tipoDocumento en ningún marco.',
+  );
+}
+
+/** Tras el modal de inconsistencia: abre el desplegable y elige SIN DOCUMENTO (control id inicio.tipoDocumento, suele ser un input Dojo). */
+async function selectSunatInicioTipoDocumentoSinDocumento(page: Page, onStep?: StepReporter): Promise<void> {
+  const normalizedTarget = "sin documento";
+
+  await onStep?.(
+    'SUNAT: elijo «Sin documento»: hago clic en el campo id="inicio.tipoDocumento" (input/combo) para abrir la lista y selecciono la opción.',
+  );
+
+  const { fieldLoc, widgetLoc } = await resolveSunatInicioTipoDocumentoControls(page, 30_000, onStep);
+
+  async function clickMenuSinDocumento(): Promise<boolean> {
+    for (const scope of collectPageScopes(page)) {
+      const candidates = scope.locator(
+        [
+          ".dijitMenuPopup:visible .dijitMenuItemLabel",
+          ".dijitMenuPopup:visible td.dijitMenuItemLabel",
+          ".dijitMenu:visible .dijitMenuItemLabel",
+          ".dijitMenu:visible td.dijitMenuItemLabel",
+          ".dijitSelectMenu:visible .dijitMenuItemLabel",
+          ".dijitComboBoxMenu:visible .dijitMenuItemLabel",
+        ].join(", "),
+      );
+      const n = await candidates.count().catch(() => 0);
+      for (let i = 0; i < n; i += 1) {
+        const cell = candidates.nth(i);
+        if (!(await cell.isVisible().catch(() => false))) {
+          continue;
+        }
+        const raw = (await cell.textContent().catch(() => "")) || "";
+        const norm = raw
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .replace(/\s+/g, " ")
+          .trim()
+          .toLowerCase();
+        if (!norm.includes(normalizedTarget)) {
+          continue;
+        }
+        await onStep?.(`SUNAT: en la lista abierta elijo «${raw.trim()}».`);
+        await cell.click({ timeout: 8_000 }).catch(() => cell.click({ force: true }));
+        return true;
+      }
+    }
+    return false;
+  }
+
+  async function openDropdown(): Promise<void> {
+    await onStep?.(
+      "SUNAT: clic en el campo id=inicio.tipoDocumento (input/combo) para abrir la lista de opciones.",
+    );
+    if ((await fieldLoc.count().catch(() => 0)) > 0) {
+      await fieldLoc.scrollIntoViewIfNeeded().catch(() => undefined);
+      const inputVisible = await fieldLoc.isVisible().catch(() => false);
+      await fieldLoc
+        .click({ timeout: 12_000, force: !inputVisible })
+        .catch(async () => {
+          await onStep?.("SUNAT: segundo intento de clic en id=inicio.tipoDocumento (force).");
+          await fieldLoc.click({ force: true, timeout: 8_000 }).catch(() => undefined);
+        });
+      return;
+    }
+    if (await widgetLoc.isVisible().catch(() => false)) {
+      await widgetLoc.scrollIntoViewIfNeeded().catch(() => undefined);
+      await widgetLoc.click({ timeout: 12_000 }).catch(async () => {
+        await onStep?.("SUNAT: clic en #widget_inicio.tipoDocumento; el input aún no está en el DOM.");
+        await widgetLoc.click({ force: true, timeout: 8_000 }).catch(() => undefined);
+      });
+    }
+  }
+
+  await openDropdown();
+  await page.waitForTimeout(450);
+
+  if (await clickMenuSinDocumento()) {
+    await page.waitForTimeout(200);
+    await onStep?.('SUNAT: quedó «Sin documento» en tipo de documento (id=inicio.tipoDocumento).');
+    return;
+  }
+
+  await onStep?.("SUNAT: no vi la opción en la lista; repito clic para abrir el desplegable.");
+  await openDropdown();
+  await page.waitForTimeout(450);
+
+  if (await clickMenuSinDocumento()) {
+    await page.waitForTimeout(200);
+    await onStep?.('SUNAT: quedó «Sin documento» en tipo de documento (id=inicio.tipoDocumento).');
+    return;
+  }
+
+  const arrow = widgetLoc.locator(".dijitDownArrowButton, .dijitArrowButton, .dijitArrowButtonInner").first();
+  if (await arrow.isVisible().catch(() => false)) {
+    await onStep?.("SUNAT: abro con la flecha del combo.");
+    await arrow.click().catch(() => undefined);
+    await page.waitForTimeout(400);
+    if (await clickMenuSinDocumento()) {
+      await page.waitForTimeout(200);
+      await onStep?.('SUNAT: quedó «Sin documento» vía flecha del combo.');
+      return;
+    }
+  }
+
+  const domFallback = await fieldLoc
+    .evaluate((root) => {
+      const from = root as Element;
+
+      function normText(s: string): string {
+        return s
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .replace(/\s+/g, " ")
+          .trim()
+          .toLowerCase();
+      }
+
+      function findHiddenTipoDocumento(el: Element): HTMLInputElement | null {
+        const widget = el.closest("[widgetid]");
+        const hW = widget?.querySelector('input[type="hidden"][name="tipoDocumento"]');
+        if (hW instanceof HTMLInputElement) {
+          return hW;
+        }
+        let p: Element | null = el.parentElement;
+        for (let depth = 0; depth < 12 && p; depth += 1) {
+          const h = p.querySelector('input[type="hidden"][name="tipoDocumento"]');
+          if (h instanceof HTMLInputElement) {
+            return h;
+          }
+          p = p.parentElement;
+        }
+        const g = document.querySelector('input[type="hidden"][name="tipoDocumento"]');
+        return g instanceof HTMLInputElement ? g : null;
+      }
+
+      function findSinDocumentoPair(): { value: string; label: string } | null {
+        const roots: Element[] = [];
+        const w = from.closest("[widgetid]");
+        if (w) {
+          roots.push(w);
+        }
+        const form = from.closest("form");
+        if (form) {
+          roots.push(form);
+        }
+        roots.push(document.body);
+
+        const seen = new Set<Element>();
+        for (const c of roots) {
+          if (seen.has(c)) {
+            continue;
+          }
+          seen.add(c);
+          for (const sel of Array.from(c.querySelectorAll("select"))) {
+            for (const opt of Array.from(sel.options)) {
+              const t = normText(opt.label || opt.textContent || "");
+              if (t.includes("sin documento")) {
+                const label = (opt.label || opt.textContent || "").replace(/\s+/g, " ").trim();
+                return { value: opt.value, label };
+              }
+            }
+          }
+        }
+
+        for (const sel of Array.from(document.querySelectorAll("select"))) {
+          for (const opt of Array.from(sel.options)) {
+            const t = normText(opt.label || opt.textContent || "");
+            if (t.includes("sin documento")) {
+              const label = (opt.label || opt.textContent || "").replace(/\s+/g, " ").trim();
+              return { value: opt.value, label };
+            }
+          }
+        }
+        return null;
+      }
+
+      const pair = findSinDocumentoPair();
+      if (!pair) {
+        return { ok: false as const, reason: "sin-par-en-selects" };
+      }
+
+      const hidden = findHiddenTipoDocumento(from);
+      const textBox =
+        document.getElementById("inicio.tipoDocumento") instanceof HTMLInputElement
+          ? (document.getElementById("inicio.tipoDocumento") as HTMLInputElement)
+          : from instanceof HTMLInputElement
+            ? from
+            : null;
+
+      if (hidden) {
+        hidden.value = pair.value;
+        hidden.dispatchEvent(new Event("input", { bubbles: true }));
+        hidden.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+
+      if (textBox) {
+        textBox.value = pair.label;
+        textBox.setAttribute("value", pair.label);
+        textBox.dispatchEvent(new Event("input", { bubbles: true }));
+        textBox.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+
+      return {
+        ok: true as const,
+        code: pair.value,
+        label: pair.label,
+        updatedHidden: Boolean(hidden),
+        updatedTextbox: Boolean(textBox),
+      };
+    })
+    .catch(() => ({ ok: false as const, reason: "evaluate-error" }));
+
+  if (!domFallback.ok) {
+    throw new Error(
+      `No pude elegir «Sin documento»: el menú Dojo no respondió y el respaldo DOM falló (${"reason" in domFallback ? domFallback.reason : "desconocido"}). Hace falta un <select> en la página con la opción o input hidden name=tipoDocumento.`,
+    );
+  }
+
+  await onStep?.(
+    `SUNAT: respaldo DOM: input#inicio.tipoDocumento → «${domFallback.label}»; hidden name=tipoDocumento → value="${domFallback.code}".`,
+  );
+}
+
+function describePageScopeForLog(scope: PageScope): string {
+  if ("url" in scope && typeof scope.url === "function") {
+    try {
+      const u = scope.url();
+      return u ? `marco ${u}` : "marco (sin URL)";
+    } catch {
+      return "marco";
+    }
+  }
+  return "página principal";
+}
+
+async function tryClickSunatModalAceptar(
+  page: Page,
+  dialogScope: PageScope,
+  modalRoot: Locator | null,
+  onStep?: StepReporter,
+): Promise<boolean> {
+  const tryLabel = async (label: string, locator: Locator): Promise<boolean> => {
+    const target = locator.first();
+    const visible = await target.isVisible().catch(() => false);
+    await onStep?.(`SUNAT modal inconsistencia: ${label} → visible=${visible ? "sí" : "no"}`);
+    if (!visible) {
+      return false;
+    }
+    try {
+      await target.click({ timeout: 8_000 });
+      await onStep?.(`SUNAT modal inconsistencia: click hecho con ${label} (normal).`);
+      return true;
+    } catch (firstError) {
+      const msg = firstError instanceof Error ? firstError.message : String(firstError);
+      await onStep?.(`SUNAT modal inconsistencia: click normal falló (${msg}); pruebo force con ${label}.`);
+      try {
+        await target.click({ force: true, timeout: 5_000 });
+        await onStep?.(`SUNAT modal inconsistencia: click force OK con ${label}.`);
+        return true;
+      } catch {
+        await onStep?.(`SUNAT modal inconsistencia: click force también falló con ${label}.`);
+        return false;
+      }
+    }
+  };
+
+  /** Botón Dojo: el nodo que suele recibir el clic es el `span` exterior con `widgetid`, no el inner `#dlgBtnAceptar`. */
+  const dlgAceptarWidgetSelectors: { label: string; sel: string }[] = [
+    { label: "span.dijitButton[widgetid=dlgBtnAceptar]", sel: 'span.dijitButton[widgetid="dlgBtnAceptar"]' },
+    { label: "span[widgetid=dlgBtnAceptar]", sel: 'span[widgetid="dlgBtnAceptar"]' },
+    { label: "[widgetid=dlgBtnAceptar]", sel: '[widgetid="dlgBtnAceptar"]' },
+  ];
+
+  const modalScoped: { label: string; locator: Locator }[] = [];
+  if (modalRoot) {
+    for (const { label, sel } of dlgAceptarWidgetSelectors) {
+      modalScoped.push({
+        label: `diálogo dijit raíz ${label}`,
+        locator: modalRoot.locator(sel),
+      });
+    }
+    modalScoped.push(
+      { label: "dentro del diálogo #dlgBtnAceptar[role=button]", locator: modalRoot.locator("#dlgBtnAceptar[role='button']") },
+      { label: "dentro del diálogo #dlgBtnAceptar", locator: modalRoot.locator("#dlgBtnAceptar") },
+      { label: "dentro del diálogo #dlgBtnAceptar_label", locator: modalRoot.locator("#dlgBtnAceptar_label") },
+      {
+        label: 'dentro del diálogo span[widgetid=dlgBtnAceptar] [role=button]',
+        locator: modalRoot.locator('span[widgetid="dlgBtnAceptar"] [role="button"]'),
+      },
+      {
+        label: "dentro del diálogo getByRole(button, Aceptar)",
+        locator: modalRoot.getByRole("button", { name: /^\s*Aceptar\s*$/i }),
+      },
+      {
+        label: "dentro del diálogo .dijitButtonText Aceptar",
+        locator: modalRoot.locator(".dijitButtonText").filter({ hasText: /^\s*Aceptar\s*$/i }),
+      },
+    );
+  }
+
+  for (const { label, locator } of modalScoped) {
+    if (await tryLabel(label, locator)) {
+      return true;
+    }
+  }
+
+  await onStep?.(
+    `SUNAT modal inconsistencia: busco widget dlgBtnAceptar en el marco del mensaje (${describePageScopeForLog(dialogScope)}).`,
+  );
+
+  for (const { label, sel } of dlgAceptarWidgetSelectors) {
+    const widgetLoc = dialogScope.locator(sel);
+    const nW = await widgetLoc.count().catch(() => 0);
+    await onStep?.(`SUNAT modal inconsistencia: en marco → ${nW}× ${label}.`);
+    for (let i = 0; i < nW; i += 1) {
+      if (await tryLabel(`marco ${label} [${i}]`, widgetLoc.nth(i))) {
+        return true;
+      }
+    }
+  }
+
+  await onStep?.(
+    `SUNAT modal inconsistencia: busco #dlgBtnAceptar (nodo foco interior) en el mismo marco (${describePageScopeForLog(dialogScope)}).`,
+  );
+
+  const scopeWide = dialogScope.locator("#dlgBtnAceptar");
+  const nScope = await scopeWide.count().catch(() => 0);
+  await onStep?.(`SUNAT modal inconsistencia: en este marco hay ${nScope} nodo(s) #dlgBtnAceptar.`);
+
+  for (let i = 0; i < nScope; i += 1) {
+    const label = `#dlgBtnAceptar en marco [índice ${i}]`;
+    if (await tryLabel(label, scopeWide.nth(i))) {
+      return true;
+    }
+  }
+
+  const scopeWideLabel = dialogScope.locator("#dlgBtnAceptar_label");
+  const nLabel = await scopeWideLabel.count().catch(() => 0);
+  await onStep?.(`SUNAT modal inconsistencia: en este marco hay ${nLabel} nodo(s) #dlgBtnAceptar_label.`);
+
+  for (let i = 0; i < nLabel; i += 1) {
+    const label = `#dlgBtnAceptar_label en marco [índice ${i}]`;
+    if (await tryLabel(label, scopeWideLabel.nth(i))) {
+      return true;
+    }
+  }
+
+  await onStep?.("SUNAT modal inconsistencia: barro todos los marcos por widget dlgBtnAceptar y #dlgBtnAceptar.");
+  for (const scope of collectPageScopes(page)) {
+    const scopeTag = describePageScopeForLog(scope);
+    for (const { label, sel } of dlgAceptarWidgetSelectors) {
+      const wLoc = scope.locator(sel);
+      const nw = await wLoc.count().catch(() => 0);
+      if (nw === 0) {
+        continue;
+      }
+      await onStep?.(`SUNAT modal inconsistencia: global ${scopeTag} → ${nw}× ${label}.`);
+      for (let j = 0; j < nw; j += 1) {
+        if (await tryLabel(`global ${scopeTag} ${label}[${j}]`, wLoc.nth(j))) {
+          return true;
+        }
+      }
+    }
+
+    const loc = scope.locator("#dlgBtnAceptar");
+    const n = await loc.count().catch(() => 0);
+    if (n === 0) {
+      continue;
+    }
+    await onStep?.(`SUNAT modal inconsistencia: marco ${scopeTag} → ${n} #dlgBtnAceptar (inner).`);
+    for (let j = 0; j < n; j += 1) {
+      if (await tryLabel(`#dlgBtnAceptar global ${scopeTag}[${j}]`, loc.nth(j))) {
+        return true;
+      }
+    }
+  }
+
+  if (modalRoot) {
+    const closeIcon = modalRoot.locator(".dijitDialogCloseIcon, [class*='DialogCloseIcon']").first();
+    if (await tryLabel("icono cerrar .dijitDialogCloseIcon", closeIcon)) {
+      return true;
+    }
+  }
+
+  await onStep?.(
+    "SUNAT modal inconsistencia: no se pudo hacer click en Aceptar ni en la X; el modal puede seguir abierto.",
+  );
+  return false;
+}
+
+async function tryRecoverSunatInconsistentIdentityModal(
+  page: Page,
+  profile: SiteProfile,
+  draft: InvoiceDraft,
+  onStep?: StepReporter,
+): Promise<boolean> {
+  if (!profile.sunat.customerDocumentTypeSelector) {
+    return false;
+  }
+
+  let dialogHit: { scope: PageScope; modalRoot: Locator | null } | null = null;
+
+  for (const scope of collectPageScopes(page)) {
+    const messageLocator = scope.getByText(SUNAT_INCONSISTENT_IDENTITY_MODAL_RE);
+    const messageCount = await messageLocator.count().catch(() => 0);
+    let messageVisible = false;
+    for (let m = 0; m < Math.min(messageCount, 12); m += 1) {
+      if (await messageLocator.nth(m).isVisible().catch(() => false)) {
+        messageVisible = true;
+        await onStep?.(`SUNAT modal inconsistencia: nodo de mensaje visible en coincidencia [${m}] (${describePageScopeForLog(scope)}).`);
+        break;
+      }
+    }
+    if (!messageVisible) {
+      continue;
+    }
+
+    let modalRoot: Locator | null = null;
+    const dialogs = scope.locator(".dijitDialog").filter({ hasText: SUNAT_INCONSISTENT_IDENTITY_MODAL_RE });
+    const dCount = await dialogs.count().catch(() => 0);
+
+    for (let i = 0; i < Math.min(dCount, 12); i += 1) {
+      const candidate = dialogs.nth(i);
+      if (await candidate.isVisible().catch(() => false)) {
+        modalRoot = candidate;
+        await onStep?.(`SUNAT modal inconsistencia: usando .dijitDialog visible que contiene el mensaje (índice ${i}).`);
+        break;
+      }
+    }
+
+    if (!modalRoot) {
+      const anyVisible = scope.locator(".dijitDialog:visible");
+      const anyCount = await anyVisible.count().catch(() => 0);
+      await onStep?.(
+        `SUNAT modal inconsistencia: no hallé .dijitDialog filtrado por texto; hay ${anyCount} .dijitDialog:visible en este marco — busco Aceptar igual en el marco.`,
+      );
+    }
+
+    dialogHit = { scope, modalRoot };
+    break;
+  }
+
+  if (!dialogHit) {
+    return false;
+  }
+
+  await onStep?.(
+    "SUNAT: cierro el aviso (Aceptar), elijo Sin documento y escribo el nombre del cliente a mano.",
+  );
+
+  const closed = await tryClickSunatModalAceptar(page, dialogHit.scope, dialogHit.modalRoot, onStep);
+  if (!closed) {
+    throw new Error(
+      "SUNAT mostró documento de identidad inconsistente pero no pude cerrar el modal (botón Aceptar no encontrado o click falló). Revisa los pasos registrados arriba.",
+    );
+  }
+
+  await page.waitForTimeout(500);
+
+  const stillMessage = await dialogHit.scope
+    .getByText(SUNAT_INCONSISTENT_IDENTITY_MODAL_RE)
+    .first()
+    .isVisible()
+    .catch(() => false);
+  if (stillMessage) {
+    await onStep?.(
+      "SUNAT modal inconsistencia: el mensaje inconsistente sigue visible tras Aceptar; reintento cerrar el modal.",
+    );
+    const retryClosed = await tryClickSunatModalAceptar(page, dialogHit.scope, dialogHit.modalRoot, onStep);
+    await page.waitForTimeout(400);
+    const stillThere = await dialogHit.scope
+      .getByText(SUNAT_INCONSISTENT_IDENTITY_MODAL_RE)
+      .first()
+      .isVisible()
+      .catch(() => false);
+    if (stillThere || !retryClosed) {
+      throw new Error(
+        "SUNAT: el modal de documento inconsistente sigue abierto después de intentar Aceptar dos veces. Revisa los pasos registrados (visibilidad de #dlgBtnAceptar).",
+      );
+    }
+  } else {
+    await onStep?.("SUNAT modal inconsistencia: el aviso ya no está visible; continúo con tipo Sin documento.");
+  }
+
+  await page.waitForTimeout(1_000);
+  await selectSunatInicioTipoDocumentoSinDocumento(page, onStep);
+  await page.waitForTimeout(400);
+
+  const nameSelectorsRecovery = uniqueSelectors([
+    "#inicio\\.razonSocial",
+    "xpath=//*[@id='inicio.razonSocial']",
+    ...customerNameSelectors(profile.sunat.customerNameSelector),
+  ]);
+
+  const nameField = await waitForAnyVisibleLocatorInPageTree(page, nameSelectorsRecovery, 15_000);
+
+  const nameDeadline = Date.now() + 12_000;
+  while (Date.now() < nameDeadline) {
+    if (await nameField.locator.isEditable().catch(() => false)) {
+      break;
+    }
+    await page.waitForTimeout(200);
+  }
+
+  await nameField.locator.fill(draft.customer.name);
+  await nameField.locator.press("Tab").catch(() => undefined);
+
+  return true;
 }
 
 function collectPageScopes(page: Page): PageScope[] {
@@ -3306,7 +4733,9 @@ export function customerNameSelectors(primarySelector: string): string[] {
 function customerDocumentTypeSelectors(primarySelector: string): string[] {
   return uniqueSelectors([
     primarySelector,
+    "#inicio\\.tipoDocumento",
     "xpath=//*[@id='inicio.tipoDocumento']",
+    "xpath=//*[@id='widget_inicio.tipoDocumento']",
     "xpath=//td[contains(normalize-space(.), 'Seleccione el Tipo de documento y número de documento del Cliente')]/following-sibling::td//select[1]",
     "xpath=//td[contains(normalize-space(.), 'Seleccione el Tipo de documento y numero de documento del Cliente')]/following-sibling::td//select[1]",
   ]);
