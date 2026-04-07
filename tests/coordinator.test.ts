@@ -252,6 +252,8 @@ describe("AutomationCoordinator", () => {
     expect(runs[0]?.outputJsonContent).toContain("\"dni\": \"20101010101\"");
     expect(runs[0]?.outputJsonContent).toContain("\"productCount\": 1");
     expect(runs[0]?.outputJsonContent).toContain("\"total\": 350");
+    expect(runs[0]?.outputJsonContent).toContain("\"products\"");
+    expect(runs[0]?.outputJsonContent).toContain("Monitor");
     expect(runs[0]?.outputJsonContent).not.toContain("\"receiptNumber\"");
     expect(runs[0]?.outputJsonContent).not.toContain("\"receiptPrefix\"");
     expect(runs[0]?.summary.boletasDownloadDir).toBeUndefined();

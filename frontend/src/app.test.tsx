@@ -75,9 +75,11 @@ describe("DashboardWorkspace", () => {
     expect(screen.getAllByText("Exportar salida JSON").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Exportando JSON de ventas").length).toBeGreaterThan(0);
     expect(screen.getByText("Actividad en vivo")).toBeInTheDocument();
-    expect(screen.getByText("Ultimos eventos")).toBeInTheDocument();
+    expect(screen.getByText("Registro de eventos")).toBeInTheDocument();
     expect(screen.getByText(/Se exporto el JSON del paso 1/i)).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: /Logs/i })).toBeInTheDocument();
+    const logsTab = screen.getByRole("tab", { name: /Logs/i });
+    expect(logsTab).toBeInTheDocument();
+    expect(logsTab).toHaveAttribute("data-state", "active");
   });
 
   it("shows the launch action and latest run when there is no active run", () => {
