@@ -16,6 +16,7 @@ import { Button } from "../ui/button";
 import { HighlightedJson } from "../json-highlight";
 import { cn } from "../../lib/utils";
 import { useStickToBottomScroll } from "../../hooks/use-stick-to-bottom-scroll";
+import { ExpandableLogMessage } from "../expandable-log-message";
 import type {
   WorkflowStepView,
   WorkflowStatusView,
@@ -126,7 +127,7 @@ function LogConsole({
     info: "text-foreground/60",
     warn: "text-warning",
     error: "text-destructive",
-    debug: "text-muted-foreground/50",
+    debug: "text-sky-500/80 dark:text-sky-400/75",
   };
 
   return (
@@ -135,10 +136,18 @@ function LogConsole({
         {logs.map((log, index) => (
           <div key={index} className="flex items-start gap-2 border-b border-border/5 px-2 py-1 last:border-b-0">
             <span className="shrink-0 text-muted-foreground/30">{log.timestamp}</span>
-            <span className={cn("w-8 shrink-0 font-mono font-medium uppercase", levelStyles[log.level] || levelStyles.info)}>
-              {log.level}
+            <span className={cn("w-10 shrink-0 font-mono font-medium uppercase", levelStyles[log.level] || levelStyles.info)}>
+              {log.level === "debug" ? "dbg" : log.level}
             </span>
-            <span className="break-all font-mono text-foreground/60">{log.message}</span>
+            <ExpandableLogMessage
+              text={log.message}
+              preWrap={log.level === "debug"}
+              expandTone="invert"
+              className={cn(
+                "break-all font-mono text-foreground/60",
+                log.level === "debug" && "text-sky-700/90 dark:text-sky-300/85",
+              )}
+            />
           </div>
         ))}
       </div>
@@ -184,7 +193,11 @@ function LiveActivityPanel({ step }: { step: WorkflowStepView }) {
               <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
                 {currentLabel}
               </p>
-              <p className="text-sm leading-5 text-foreground">{currentMessage}</p>
+              <ExpandableLogMessage
+                text={currentMessage}
+                preWrap
+                className="text-sm leading-5 text-foreground"
+              />
               {liveSubStep?.name ? (
                 <p className="text-[11px] leading-5 text-muted-foreground">{liveSubStep.name}</p>
               ) : null}

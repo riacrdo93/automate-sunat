@@ -19,9 +19,14 @@ export interface SubmissionContext {
   boletasDownloadDir?: string;
 }
 
+export interface FetchSalesOptions {
+  /** Fecha local YYYY-MM-DD. Si falta, no se abre el date picker en Documentos tributarios (Falabella). */
+  falabellaDocumentsSearchFromIso?: string;
+}
+
 export interface SellerSource {
-  fetchSales(onStep: StepReporter): Promise<Sale[]>;
-  refreshSale(externalId: string, onStep: StepReporter): Promise<Sale | undefined>;
+  fetchSales(onStep: StepReporter, options?: FetchSalesOptions): Promise<Sale[]>;
+  refreshSale(externalId: string, onStep: StepReporter, options?: FetchSalesOptions): Promise<Sale | undefined>;
   captureSaleEvidence(sale: Sale, attemptId: string, onStep: StepReporter): Promise<Artifact[]>;
 }
 
@@ -95,7 +100,7 @@ export class ConfigurableSellerSource implements SellerSource {
     private readonly profile: SiteProfile,
   ) {}
 
-  async fetchSales(onStep: StepReporter): Promise<Sale[]> {
+  async fetchSales(onStep: StepReporter, _options?: FetchSalesOptions): Promise<Sale[]> {
     await onStep("Abriendo sesión del navegador para Seller");
 
     const browser = await this.launchBrowser();
@@ -258,8 +263,12 @@ export class ConfigurableSellerSource implements SellerSource {
     }
   }
 
-  async refreshSale(externalId: string, onStep: StepReporter): Promise<Sale | undefined> {
-    const sales = await this.fetchSales(onStep);
+  async refreshSale(
+    externalId: string,
+    onStep: StepReporter,
+    options?: FetchSalesOptions,
+  ): Promise<Sale | undefined> {
+    const sales = await this.fetchSales(onStep, options);
     return sales.find((sale) => sale.externalId === externalId);
   }
 
@@ -412,7 +421,7 @@ export class ConfigurableSellerSource implements SellerSource {
 export class FalabellaSellerSource implements SellerSource {
   constructor(private readonly config: AppConfig) {}
 
-  async fetchSales(onStep: StepReporter): Promise<Sale[]> {
+  async fetchSales(onStep: StepReporter, options?: FetchSalesOptions): Promise<Sale[]> {
     await onStep("Abriendo Falabella Seller Center");
 
     const browser = await launchBrowser(this.config);
@@ -422,7 +431,8 @@ export class FalabellaSellerSource implements SellerSource {
     try {
       await loginToFalabella(page, this.config.sellerCredentials, onStep, this.config.sellerPurchasedOrdersUrl);
       await openFalabellaDocumentsPage(page, this.config.sellerPurchasedOrdersUrl, onStep);
-      const candidates = await collectFalabellaPendingRowsAcrossPages(page, onStep);
+      const searchFromIso = options?.falabellaDocumentsSearchFromIso;
+      const candidates = await collectFalabellaPendingRowsAcrossPages(page, onStep, searchFromIso);
       const sales: Sale[] = [];
 
       for (const candidate of candidates) {
@@ -454,7 +464,7 @@ export class FalabellaSellerSource implements SellerSource {
     }
   }
 
-  async refreshSale(externalId: string, onStep: StepReporter): Promise<Sale | undefined> {
+  async refreshSale(externalId: string, onStep: StepReporter, options?: FetchSalesOptions): Promise<Sale | undefined> {
     await onStep(`Refrescando la orden ${externalId} en Falabella`);
 
     const browser = await launchBrowser(this.config);
@@ -464,7 +474,12 @@ export class FalabellaSellerSource implements SellerSource {
     try {
       await loginToFalabella(page, this.config.sellerCredentials, onStep, this.config.sellerPurchasedOrdersUrl);
       await openFalabellaDocumentsPage(page, this.config.sellerPurchasedOrdersUrl, onStep);
-      const candidate = await findFalabellaPendingRowByOrderIdAcrossPages(page, externalId, onStep);
+      const candidate = await findFalabellaPendingRowByOrderIdAcrossPages(
+        page,
+        externalId,
+        onStep,
+        options?.falabellaDocumentsSearchFromIso,
+      );
       if (!candidate) {
         return undefined;
       }
@@ -547,7 +562,23 @@ export class SunatPortalEmitter implements InvoiceEmitter {
       slowMo: this.config.slowMoMs,
     });
     const browserContext = await this.newContext(browser, "sunat.json");
+    await onStep(
+      "[sunat-modal-trace] Modal «Valida tus datos de contacto» (SUNAT): vigilancia activa. Se busca en la página el bloque #divModalCampana y el iframe #ifrVCE; el contenido del iframe es otra web (p. ej. ww1.sunat.gob.pe), por eso el mismo script se vuelve a ejecutar dentro de ese iframe al cargar — allí están los botones. Cada 3 s se revisa. Textos largos = diagnóstico; avisos cortos al cerrar = info.",
+    );
     const page = await browserContext.newPage();
+    const sunatModalLogPrefix = "[automate-sunat:sunat-modal] ";
+    const sunatModalTracePrefix = "[automate-sunat:sunat-modal-trace] ";
+    page.on("console", (msg) => {
+      const text = msg.text();
+      if (text.startsWith(sunatModalTracePrefix)) {
+        void onStep(`[sunat-modal-trace] ${text.slice(sunatModalTracePrefix.length)}`);
+        return;
+      }
+      if (!text.startsWith(sunatModalLogPrefix)) {
+        return;
+      }
+      void onStep(text.slice(sunatModalLogPrefix.length));
+    });
     const tracePath = path.join(this.config.dataPaths.tracesDir, `${attemptId}.zip`);
     const preSubmitScreenshot = path.join(
       this.config.dataPaths.screenshotsDir,
@@ -731,11 +762,12 @@ export class SunatPortalEmitter implements InvoiceEmitter {
   private async newContext(browser: Browser, authFileName: string): Promise<BrowserContext> {
     const authPath = path.join(this.config.dataPaths.authDir, authFileName);
 
-    if (fs.existsSync(authPath)) {
-      return browser.newContext({ storageState: authPath });
-    }
+    const context = fs.existsSync(authPath)
+      ? await browser.newContext({ storageState: authPath })
+      : await browser.newContext();
 
-    return browser.newContext();
+    await installSunatContactValidationModalDismisser(context);
+    return context;
   }
 }
 
@@ -1603,11 +1635,19 @@ function* iterateFalabellaDateChunksFromYearStart(
   year: number,
   todayIso: string,
 ): Generator<{ start: string; end: string }> {
-  let chunkStart = formatFalabellaLocalIsoDate(year, 1, 1);
-  if (chunkStart.localeCompare(todayIso) > 0) {
+  const fromJan1 = formatFalabellaLocalIsoDate(year, 1, 1);
+  yield* iterateFalabellaDateChunksFromRangeStart(fromJan1, todayIso);
+}
+
+function* iterateFalabellaDateChunksFromRangeStart(
+  rangeStartIso: string,
+  todayIso: string,
+): Generator<{ start: string; end: string }> {
+  if (rangeStartIso.localeCompare(todayIso) > 0) {
     return;
   }
 
+  let chunkStart = rangeStartIso;
   while (chunkStart.localeCompare(todayIso) <= 0) {
     const chunkEndInclusive = addCalendarDaysToFalabellaIsoLocal(
       chunkStart,
@@ -1966,21 +2006,43 @@ async function collectFalabellaPendingRowsAcrossPagesWithAccumulation(
 async function collectFalabellaPendingRowsAcrossPages(
   page: Page,
   onStep: StepReporter,
+  searchFromIso?: string,
 ): Promise<FalabellaRowCandidate[]> {
   let ready = await waitForFalabellaDocumentsReadyState(page, onStep);
   if (ready === "timeout") {
     throw new Error(
-      "Falabella documentos: la vista no quedó lista antes de aplicar el filtro de fechas (tabla o vacío reconocible).",
+      "Falabella documentos: la vista no quedó lista a tiempo (tabla o vacío reconocible).",
     );
   }
 
-  const year = new Date().getFullYear();
   const todayIso = getFalabellaTodayLocalIso();
   const collected = new Map<string, FalabellaRowCandidate>();
   let totalVisitedPages = 0;
   let chunkIndex = 0;
 
-  for (const { start, end } of iterateFalabellaDateChunksFromYearStart(year, todayIso)) {
+  if (!searchFromIso) {
+    await onStep(
+      "Documentos tributarios: sin fecha de inicio; no abro el selector de fechas y recorro la bandeja tal como está.",
+    );
+    if (ready === "empty") {
+      await onStep("Documentos tributarios: la vista actual está vacía; no hay órdenes que acumular.");
+      return [];
+    }
+    const visitedPages = await collectFalabellaPendingRowsAcrossPagesWithAccumulation(page, onStep, collected);
+    totalVisitedPages = visitedPages;
+    if (collected.size === 0) {
+      await onStep(
+        "Documentos tributarios: recorrido sin ajustar fechas — sin órdenes con documento pendiente en la vista actual.",
+      );
+      return [];
+    }
+    await onStep(
+      `Documentos tributarios: ${collected.size} orden(es) con documento pendiente (${totalVisitedPages} página(s), filtro de fechas no modificado).`,
+    );
+    return Array.from(collected.values());
+  }
+
+  for (const { start, end } of iterateFalabellaDateChunksFromRangeStart(searchFromIso, todayIso)) {
     chunkIndex += 1;
     await onStep(
       `Documentos tributarios: bloque ${chunkIndex} (${start}–${end}): ${FALABELLA_DOCUMENTS_DATE_CHUNK_DAYS} días corridos; en el filtro lo parto por mes calendario.`,
@@ -2020,7 +2082,7 @@ async function collectFalabellaPendingRowsAcrossPages(
 
   if (collected.size === 0) {
     await onStep(
-      "Documentos tributarios: barridos de ~30 días desde el 1 de enero hasta hoy — sin órdenes con documento pendiente.",
+      `Documentos tributarios: barridos de ~30 días desde ${searchFromIso} hasta hoy — sin órdenes con documento pendiente.`,
     );
     return [];
   }
@@ -2035,19 +2097,66 @@ async function findFalabellaPendingRowByOrderIdAcrossPages(
   page: Page,
   orderId: string,
   onStep: StepReporter,
+  searchFromIso?: string,
 ): Promise<FalabellaRowCandidate | undefined> {
   let ready = await waitForFalabellaDocumentsReadyState(page, onStep);
   if (ready === "timeout") {
     throw new Error(
-      "Falabella documentos: la vista no quedó lista antes de aplicar el filtro de fechas (tabla o vacío reconocible).",
+      "Falabella documentos: la vista no quedó lista a tiempo (tabla o vacío reconocible).",
     );
   }
 
-  const year = new Date().getFullYear();
   const todayIso = getFalabellaTodayLocalIso();
   let chunkIndex = 0;
 
-  for (const { start, end } of iterateFalabellaDateChunksFromYearStart(year, todayIso)) {
+  if (!searchFromIso) {
+    await onStep(
+      `Documentos tributarios: sin fecha de inicio; busco la orden ${orderId} sin abrir el selector de fechas.`,
+    );
+    if (ready === "empty") {
+      await onStep(
+        `Documentos tributarios: la vista actual está vacía; la orden ${orderId} no aparece sin cambiar fechas.`,
+      );
+      return undefined;
+    }
+    await ensureFalabellaDocumentsStartFromFirstPage(page, onStep);
+    const visitedPageStates = new Set<string>();
+
+    while (true) {
+      await waitForFalabellaDocumentsRows(page, 30_000, onStep);
+      const pagination = await readFalabellaPaginationState(page);
+      const pageState = await buildFalabellaPageStateKey(page, pagination.currentPage);
+
+      if (visitedPageStates.has(pageState)) {
+        break;
+      }
+
+      visitedPageStates.add(pageState);
+      await onStep(
+        pagination.totalPages > 1
+          ? `Documentos tributarios: busco ${orderId} en pág. ${pagination.currentPage} de ${pagination.totalPages} (filtro actual).`
+          : `Documentos tributarios: busco ${orderId} en la página disponible (filtro actual).`,
+      );
+
+      const row = await findFalabellaOrderRowByOrderId(page, orderId);
+      if (row) {
+        return extractEnabledFalabellaRow(row, orderId);
+      }
+
+      if (!pagination.hasNextPage) {
+        break;
+      }
+
+      await goToNextFalabellaDocumentsPage(page, pagination.currentPage, pageState, onStep);
+    }
+
+    await onStep(
+      `Documentos tributarios: la orden ${orderId} no apareció al paginar la vista actual (sin ajustar fechas).`,
+    );
+    return undefined;
+  }
+
+  for (const { start, end } of iterateFalabellaDateChunksFromRangeStart(searchFromIso, todayIso)) {
     chunkIndex += 1;
     let partIndex = 0;
     for (const { start: segStart, end: segEnd } of subdivideFalabellaIsoRangeByCalendarMonth(start, end)) {
@@ -2102,7 +2211,7 @@ async function findFalabellaPendingRowByOrderIdAcrossPages(
   }
 
   await onStep(
-    `Documentos tributarios: la orden ${orderId} no apareció en tramos de ~30 días desde el 1 de enero hasta hoy.`,
+    `Documentos tributarios: la orden ${orderId} no apareció en tramos de ~30 días desde ${searchFromIso} hasta hoy.`,
   );
   return undefined;
 }
@@ -3580,6 +3689,422 @@ async function navigateSunatSolMenu(page: Page, labels: string[], onStep: StepRe
     await target.click();
     await page.waitForTimeout(500);
   }
+}
+
+/**
+ * Cierra en segundo plano el flujo «Valida tus datos de contacto» (modal informativo + «Continuar sin confirmar»).
+ * Debe ejecutarse en cada marco: la campaña suele cargarse en un iframe cross-origin (p. ej. ifrVCE → ww1.sunat.gob.pe);
+ * desde el top no se puede leer ese documento, pero addInitScript corre también al cargar el iframe.
+ * Traza: prefijo [automate-sunat:sunat-modal-trace] → nivel debug en dashboard. Cierre de modal: [automate-sunat:sunat-modal] → info.
+ * Al instalarse en cada marco se emite un bloque «Vigilante instalado…» (TOP vs IFRAME).
+ */
+async function installSunatContactValidationModalDismisser(context: BrowserContext): Promise<void> {
+  await context.addInitScript(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const installKey = "__automateSunatContactValidationDismiss";
+    const win = window as unknown as Record<string, unknown>;
+    if (win[installKey]) {
+      return;
+    }
+    win[installKey] = true;
+
+    const LOG_PREFIX = "[automate-sunat:sunat-modal] ";
+    const TRACE_PREFIX = "[automate-sunat:sunat-modal-trace] ";
+    let tickSeq = 0;
+
+    function logStep(message: string): void {
+      try {
+        console.log(`${LOG_PREFIX}${message}`);
+      } catch {
+        /* ignore */
+      }
+    }
+
+    function logTraceBlock(lines: string[]): void {
+      try {
+        console.log(`${TRACE_PREFIX}${lines.join("\n")}`);
+      } catch {
+        /* ignore */
+      }
+    }
+
+    (function logInstallBanner(): void {
+      const isTop = window === window.top;
+      let host = "";
+      try {
+        host = window.location.hostname || "(sin host)";
+      } catch {
+        host = "?";
+      }
+      const lines = [
+        "━━ Vigilante instalado en este marco (se repite en TOP y dentro de cada iframe al cargar) ━━",
+        isTop
+          ? "TOP: en esta vista buscamos #divModalCampana y #ifrVCE. El iframe apunta a otro sitio; el navegador no deja leer su DOM desde aquí, pero el mismo script corre dentro del iframe cuando esa URL carga — allí se detectan y cierran los modales."
+          : "IFRAME: este documento es el de la URL del iframe (p. ej. campaña ww1.sunat…). Aquí están los botones; el TOP solo ve el marco vacío desde fuera.",
+        `Marco actual: ${isTop ? "TOP (principal)" : "IFRAME (interior)"} · host=${host}`,
+      ];
+      logTraceBlock(lines);
+    })();
+
+    function hostnameLooksLikeSunat(): boolean {
+      try {
+        return /sunat/i.test(window.location.hostname || "");
+      } catch {
+        return false;
+      }
+    }
+
+    function collectAccessibleDocuments(root: Window, acc: Document[], seen: Set<Window>): void {
+      if (seen.has(root)) {
+        return;
+      }
+      seen.add(root);
+      try {
+        acc.push(root.document);
+      } catch {
+        return;
+      }
+      for (let i = 0; i < root.frames.length; i += 1) {
+        try {
+          collectAccessibleDocuments(root.frames[i] as Window, acc, seen);
+        } catch {
+          /* cross-origin */
+        }
+      }
+    }
+
+    function elementLooksVisibleInDocument(el: HTMLElement, doc: Document): boolean {
+      if (!doc.documentElement.contains(el)) {
+        return false;
+      }
+      const view = doc.defaultView;
+      if (!view) {
+        return false;
+      }
+      const cs = view.getComputedStyle(el);
+      if (cs.display === "none" || cs.visibility === "hidden" || Number(cs.opacity) === 0) {
+        return false;
+      }
+      if (el.getAttribute("aria-hidden") === "true") {
+        return false;
+      }
+      const r = el.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2) {
+        return false;
+      }
+      if (el.hasAttribute("disabled")) {
+        return false;
+      }
+      return true;
+    }
+
+    function dispatchClick(el: HTMLElement, view: Window): void {
+      try {
+        el.click();
+        return;
+      } catch {
+        /* ignore */
+      }
+      try {
+        el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view }));
+      } catch {
+        /* ignore */
+      }
+    }
+
+    function tryCallHide(winLike: Window | null): void {
+      if (!winLike) {
+        return;
+      }
+      try {
+        const fn = (winLike as unknown as { callHide?: () => void }).callHide;
+        if (typeof fn === "function") {
+          fn();
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+
+    const presence = {
+      sawFinalizarModal: false,
+      sawCerrarModal: false,
+    };
+
+    function tryDismissContactValidationModals(): void {
+      tickSeq += 1;
+      const isTop = window === window.top;
+      let host = "";
+      let pathSnippet = "";
+      try {
+        host = window.location.hostname || "";
+        pathSnippet = (window.location.pathname || "").slice(0, 96);
+      } catch {
+        /* ignore */
+      }
+
+      const trace: string[] = [];
+      trace.push(
+        `[cada 3 s] Ciclo #${tickSeq} — se ejecuta el método de vigilancia (setInterval 3000 ms). En este ciclo busco: en TOP → #divModalCampana y iframe id="ifrVCE"; en cada marco → botones del modal.`,
+      );
+      trace.push(
+        `Paso 0 · Marco: ${isTop ? "TOP (ventana principal)" : "IFRAME/submarco"} · host=${host || "?"} · ruta=${pathSnippet || "?"}`,
+      );
+
+      const sunatOk = hostnameLooksLikeSunat();
+      trace.push(
+        `Paso 1 · ¿Hostname SUNAT? → ${sunatOk ? "sí · continúo búsqueda de botones" : "no · no aplica campaña aquí; fin de este ciclo"}`,
+      );
+      if (!sunatOk) {
+        trace.push(
+          `Fin ciclo #${tickSeq} · próxima pasada del mismo método en ~3 s (setInterval 3000 ms). En host SUNAT se buscaría #ifrVCE en TOP.`,
+        );
+        logTraceBlock(trace);
+        presence.sawFinalizarModal = false;
+        presence.sawCerrarModal = false;
+        return;
+      }
+
+      if (isTop) {
+        trace.push(
+          "Paso 2 · Desde TOP: localizar contenedor de campaña SUNAT y el iframe de validación de datos.",
+        );
+        try {
+          trace.push("Paso 2a · Busco #divModalCampana (contenedor del modal de campaña / validación de contacto)…");
+          const divModalCampana = document.getElementById("divModalCampana");
+          if (!divModalCampana) {
+            trace.push("   · resultado: #divModalCampana no está en el DOM de este documento.");
+            trace.push("   · nota: si el menú SUNAT está en otro marco, ese documento es el que debe tener este div.");
+          } else {
+            trace.push("   · resultado: #divModalCampana encontrado.");
+            if (divModalCampana instanceof HTMLElement) {
+              const cs = window.getComputedStyle(divModalCampana);
+              trace.push(
+                `   · caja: class="${(divModalCampana.getAttribute("class") || "").slice(0, 60)}" · display=${cs.display} · visibility=${cs.visibility}`,
+              );
+              const inTree = document.documentElement.contains(divModalCampana);
+              trace.push(`   · conectado al documento actual: ${inTree ? "sí" : "no"}`);
+            }
+          }
+
+          trace.push(
+            "Paso 2b · Busco #ifrVCE (name=ifrVCE) dentro de #divModalCampana; si falta el div, busco #ifrVCE en todo el documento…",
+          );
+          let ifrVce: HTMLIFrameElement | null = null;
+          let ifrVcePath = "";
+          if (divModalCampana) {
+            ifrVce = divModalCampana.querySelector("#ifrVCE") as HTMLIFrameElement | null;
+            if (ifrVce) {
+              ifrVcePath = "descendiente directo/indirecto de #divModalCampana";
+            }
+          }
+          if (!ifrVce) {
+            const globalIfr = document.getElementById("ifrVCE");
+            if (globalIfr instanceof HTMLIFrameElement) {
+              ifrVce = globalIfr;
+              if (divModalCampana && divModalCampana.contains(globalIfr)) {
+                ifrVcePath = "#ifrVCE en documento, contenido en #divModalCampana";
+              } else if (divModalCampana) {
+                ifrVcePath =
+                  "#ifrVCE en documento pero fuera de #divModalCampana (revisar estructura HTML)";
+              } else {
+                ifrVcePath = "#ifrVCE en documento (sin #divModalCampana previo)";
+              }
+            }
+          }
+
+          if (!ifrVce) {
+            trace.push(
+              "RESULTADO búsqueda id=\"ifrVCE\": NO ENCONTRADO en el DOM de esta página (TOP). No hay ningún elemento con id ifrVCE todavía, o estás en otra vista. El mismo método volverá a buscar en ~3 s.",
+            );
+          } else {
+            const nm = ifrVce.getAttribute("name") || "";
+            trace.push(
+              `RESULTADO búsqueda id="ifrVCE": ENCONTRADO (${ifrVcePath}). El iframe está en el árbol HTML; el contenido interno se maneja en el marco hijo.`,
+            );
+            trace.push(`   · detalle: id=ifrVCE name=${nm || "—"}`);
+            const srcAttr = (ifrVce.getAttribute("src") || "").slice(0, 160);
+            trace.push(`   · src (recortado): ${srcAttr || "(vacío)"}`);
+            let access = "";
+            try {
+              access = ifrVce.contentDocument
+                ? "contentDocument accesible (mismo origen)"
+                : "contentDocument null → cross-origin esperado (ww1.sunat…); los botones se cierran desde el init dentro de ese marco";
+            } catch {
+              access = "no se pudo leer contentDocument (cross-origin)";
+            }
+            trace.push(`   · ${access}`);
+          }
+
+          trace.push("Paso 2c · Resumen: todos los iframe del documento TOP (orden de aparición en DOM)…");
+          const iframes = Array.prototype.slice.call(document.querySelectorAll("iframe"));
+          trace.push(`   · total iframes en página: ${iframes.length}`);
+          for (let i = 0; i < iframes.length; i += 1) {
+            const el = iframes[i] as HTMLIFrameElement;
+            const id = el.id || "—";
+            const nm = el.name || "—";
+            const src = (el.getAttribute("src") || "").slice(0, 100);
+            let access = "";
+            try {
+              access = el.contentDocument
+                ? "contentDocument OK (mismo origen)"
+                : "contentDocument null (cross-origin típico)";
+            } catch {
+              access = "error al leer (cross-origin)";
+            }
+            const campaña =
+              /campanh|modifdatos|ifrVCE/i.test(`${id} ${nm} ${src}`) ? " · campaña/modifdatos" : "";
+            trace.push(`   · [${i}] id=${id} name=${nm} · ${access}${campaña}`);
+            trace.push(`     src=${src || "—"}`);
+          }
+        } catch (e) {
+          trace.push(`   · error en Paso 2 (modal/iframes): ${String((e as Error)?.message || e)}`);
+        }
+      } else {
+        trace.push(
+          "Paso 2 · Dentro de IFRAME (p. ej. documento cargado en #ifrVCE): #divModalCampana y el wrapper del iframe solo existen en el documento TOP.",
+        );
+        trace.push(
+          "   · aquí no busco #divModalCampana; el vigilante en TOP ya registró ese contenedor; en este marco busco los botones del formulario.",
+        );
+      }
+
+      const docs: Document[] = [];
+      try {
+        collectAccessibleDocuments(window, docs, new Set());
+      } catch (e) {
+        trace.push(`Paso 3 · Error recopilando documentos same-origin: ${String((e as Error)?.message || e)}`);
+        trace.push(
+          `Fin ciclo #${tickSeq} · próxima pasada del mismo método en ~3 s (setInterval 3000 ms).`,
+        );
+        logTraceBlock(trace);
+        presence.sawFinalizarModal = false;
+        presence.sawCerrarModal = false;
+        return;
+      }
+      trace.push(`Paso 3 · Documentos same-origin desde este marco: ${docs.length}`);
+      for (let i = 0; i < docs.length; i += 1) {
+        const d = docs[i];
+        let href = "";
+        try {
+          href = (d.defaultView?.location?.href ?? d.URL ?? "").slice(0, 140);
+        } catch {
+          href = "(href no accesible)";
+        }
+        trace.push(`   · doc[${i}]: ${href}`);
+      }
+
+      trace.push("Paso 4 · Buscar #btnFinalizarValidacionDatos (visible) por documento…");
+      let anyFinalizarNode = false;
+      for (let d = 0; d < docs.length; d += 1) {
+        const doc = docs[d];
+        const el = doc.getElementById("btnFinalizarValidacionDatos");
+        if (!el) {
+          trace.push(`   · doc[${d}]: sin nodo con ese id`);
+          continue;
+        }
+        anyFinalizarNode = true;
+        const vis = el instanceof HTMLElement && elementLooksVisibleInDocument(el, doc);
+        trace.push(`   · doc[${d}]: nodo presente · visible=${vis ? "SÍ (acción: click Finalizar)" : "no"}`);
+      }
+      if (!anyFinalizarNode) {
+        trace.push("   · ningún doc tiene #btnFinalizarValidacionDatos");
+      }
+
+      trace.push('Paso 5 · Buscar #btnCerrar coherente (onclick callHide o texto «Continuar sin confirmar»)…');
+      let anyCerrarNode = false;
+      for (let d = 0; d < docs.length; d += 1) {
+        const doc = docs[d];
+        const el = doc.getElementById("btnCerrar");
+        if (!el) {
+          trace.push(`   · doc[${d}]: sin #btnCerrar`);
+          continue;
+        }
+        anyCerrarNode = true;
+        const onclick = el.getAttribute("onclick") || "";
+        const label = (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80);
+        const matches =
+          el instanceof HTMLElement &&
+          (onclick.includes("callHide") || /continuar\s+sin\s+confirmar/i.test(label));
+        const vis = el instanceof HTMLElement && elementLooksVisibleInDocument(el, doc);
+        trace.push(
+          `   · doc[${d}]: btnCerrar presente · coincide patrón=${matches ? "sí" : "no"} · visible=${vis ? "SÍ" : "no"} · texto=${label || "—"}`,
+        );
+      }
+      if (!anyCerrarNode) {
+        trace.push("   · ningún doc tiene #btnCerrar");
+      }
+
+      trace.push(
+        `Fin ciclo #${tickSeq} · próxima pasada del mismo método en ~3 s (setInterval 3000 ms; en TOP SUNAT se vuelve a buscar id="ifrVCE").`,
+      );
+      logTraceBlock(trace);
+
+      for (let d = 0; d < docs.length; d += 1) {
+        const doc = docs[d];
+        const docView = doc.defaultView;
+        if (!docView) {
+          continue;
+        }
+
+        const finalizar = doc.getElementById("btnFinalizarValidacionDatos");
+        if (finalizar instanceof HTMLElement && elementLooksVisibleInDocument(finalizar, doc)) {
+          if (!presence.sawFinalizarModal) {
+            presence.sawFinalizarModal = true;
+            logStep(
+              "SUNAT validación datos: apareció el modal «Informativo» (btnFinalizarValidacionDatos); cierro con Finalizar.",
+            );
+          }
+          dispatchClick(finalizar, docView);
+          return;
+        }
+      }
+      presence.sawFinalizarModal = false;
+
+      for (let d = 0; d < docs.length; d += 1) {
+        const doc = docs[d];
+        const docView = doc.defaultView;
+        if (!docView) {
+          continue;
+        }
+
+        const cerrar = doc.getElementById("btnCerrar");
+        if (!(cerrar instanceof HTMLElement) || !elementLooksVisibleInDocument(cerrar, doc)) {
+          continue;
+        }
+
+        const onclick = cerrar.getAttribute("onclick") || "";
+        const label = (cerrar.textContent || "").replace(/\s+/g, " ").trim();
+        if (!(onclick.includes("callHide") || /continuar\s+sin\s+confirmar/i.test(label))) {
+          continue;
+        }
+
+        if (!presence.sawCerrarModal) {
+          presence.sawCerrarModal = true;
+          logStep(
+            'SUNAT validación datos: apareció «Continuar sin confirmar» (btnCerrar); cierro y llamo callHide si existe.',
+          );
+        }
+        dispatchClick(cerrar, docView);
+        tryCallHide(docView);
+        return;
+      }
+      presence.sawCerrarModal = false;
+    }
+
+    (function logTimerRegistered(): void {
+      const lines = [
+        "Timer registrado: window.setInterval(…, 3000). La función de vigilancia se ejecuta ahora (1.ª vez) y luego cada 3000 ms; en cada ciclo en TOP SUNAT se intenta localizar #divModalCampana e iframe id=\"ifrVCE\".",
+      ];
+      logTraceBlock(lines);
+    })();
+
+    window.setInterval(tryDismissContactValidationModals, 3_000);
+    tryDismissContactValidationModals();
+  });
 }
 
 async function dismissSunatNotificationsPrompt(page: Page, onStep?: StepReporter): Promise<void> {

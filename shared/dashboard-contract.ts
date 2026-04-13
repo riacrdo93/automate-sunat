@@ -110,7 +110,7 @@ export interface WorkflowStage {
 
 export interface WorkflowLogEntry {
   at: string;
-  level: "info" | "error";
+  level: "info" | "error" | "debug";
   stageId: string;
   stepId: string;
   message: string;

@@ -12,6 +12,9 @@ interface WorkflowHeaderProps {
   totalSteps: number;
   startLabel?: string;
   runningLabel?: string;
+  /** Vacío: en Falabella no se abre el filtro de fechas (se usa el rango ya mostrado en la bandeja). */
+  falabellaDocumentsSearchFrom?: string;
+  onFalabellaDocumentsSearchFromChange?: (value: string) => void;
   onStartRun?: () => void;
   onStopRun?: () => void;
   isRunning?: boolean;
@@ -27,6 +30,8 @@ export function WorkflowHeader({
   totalSteps,
   startLabel = "Ejecutar workflow",
   runningLabel = "Workflow en curso",
+  falabellaDocumentsSearchFrom = "",
+  onFalabellaDocumentsSearchFromChange,
   onStartRun,
   onStopRun,
   isRunning = false,
@@ -115,7 +120,20 @@ export function WorkflowHeader({
             </div>
           </div>
 
-          <div className="flex shrink-0 items-center gap-2">
+          <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+            {onFalabellaDocumentsSearchFromChange ? (
+              <label className="flex max-w-full items-center gap-2 text-xs text-muted-foreground">
+                <span className="hidden whitespace-nowrap sm:inline">Buscar desde</span>
+                <input
+                  type="date"
+                  className="h-8 min-w-0 max-w-[11rem] rounded-md border border-input bg-background px-2 text-xs text-foreground shadow-sm disabled:opacity-50"
+                  value={falabellaDocumentsSearchFrom}
+                  onChange={(event) => onFalabellaDocumentsSearchFromChange(event.target.value)}
+                  disabled={isRunning}
+                  title="Falabella: vacío = no cambiar fechas. Con fecha = barrido desde ese día hasta hoy."
+                />
+              </label>
+            ) : null}
             <Button
               variant="outline"
               size="sm"

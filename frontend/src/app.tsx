@@ -19,6 +19,7 @@ import {
   resolveWorkflowActiveStepId,
 } from "./lib/workflow-view-model";
 import { findActiveRun, findRun } from "./lib/dashboard";
+import { ExpandableLogMessage } from "./components/expandable-log-message";
 
 const STEP_TWO_STAGE_ID = "registrar_facturas_sunat";
 
@@ -27,6 +28,7 @@ async function requestAction(
   options?: {
     method?: "POST" | "DELETE";
     preferredBaseUrl?: string;
+    body?: Record<string, unknown>;
   },
 ) {
   const method = options?.method ?? "POST";
@@ -34,12 +36,17 @@ async function requestAction(
 
   for (const baseUrl of getDashboardApiBaseCandidates(options?.preferredBaseUrl)) {
     try {
-      const response = await fetch(buildDashboardApiUrl(baseUrl, url), {
+      const init: RequestInit = {
         method,
         headers: {
           "Content-Type": "application/json",
         },
-      });
+      };
+      if (options?.body !== undefined) {
+        init.body = JSON.stringify(options.body);
+      }
+
+      const response = await fetch(buildDashboardApiUrl(baseUrl, url), init);
 
       const payload = (await response.json()) as { message?: string };
 
@@ -75,14 +82,16 @@ type DashboardWorkspaceProps = {
   onRetry: (attemptId: string) => void;
   pendingAction?: "run-all" | "step-2" | "stop" | null;
   deletingRunId?: string | null;
+  falabellaDocumentsSearchFrom: string;
+  onFalabellaDocumentsSearchFromChange: (value: string) => void;
 };
 
 function StatusMessage({ text }: { text: string }) {
   return (
     <div className="mb-6 rounded-xl border border-destructive/20 bg-destructive/5 px-4 py-3 text-sm text-destructive">
-      <div className="flex items-center gap-2">
-        <CircleAlert className="size-4" />
-        <span>{text}</span>
+      <div className="flex items-start gap-2">
+        <CircleAlert className="mt-0.5 size-4 shrink-0" />
+        <ExpandableLogMessage text={text} className="text-destructive" />
       </div>
     </div>
   );
@@ -111,6 +120,8 @@ export function DashboardWorkspace({
   onSelectStage,
   pendingAction = null,
   deletingRunId = null,
+  falabellaDocumentsSearchFrom,
+  onFalabellaDocumentsSearchFromChange,
 }: DashboardWorkspaceProps) {
   const [activeStepId, setActiveStepId] = useState<string>("");
   const emptyHeader = {
@@ -154,6 +165,8 @@ export function DashboardWorkspace({
             totalSteps={emptyHeader.totalSteps}
             startLabel={autoContinueStepTwo ? "Ejecutar workflow" : "Ejecutar paso 1"}
             runningLabel={autoContinueStepTwo ? "Workflow en curso" : "Paso 1 en curso"}
+            falabellaDocumentsSearchFrom={falabellaDocumentsSearchFrom}
+            onFalabellaDocumentsSearchFromChange={onFalabellaDocumentsSearchFromChange}
             onStartRun={onStartRun}
             onStopRun={onStopRun}
             isRunning={snapshot.runtime.isRunning}
@@ -246,6 +259,8 @@ export function DashboardWorkspace({
         totalSteps={header.totalSteps}
         startLabel={startRunLabel}
         runningLabel={runningRunLabel}
+        falabellaDocumentsSearchFrom={falabellaDocumentsSearchFrom}
+        onFalabellaDocumentsSearchFromChange={onFalabellaDocumentsSearchFromChange}
         onStartRun={onStartRun}
         onStopRun={onStopRun}
         isRunning={snapshot.runtime.isRunning}
@@ -301,6 +316,7 @@ export function App() {
   const [flashMessage, setFlashMessage] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<"run-all" | "step-2" | "stop" | null>(null);
   const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
+  const [falabellaDocumentsSearchFrom, setFalabellaDocumentsSearchFrom] = useState("");
   const preferredBaseUrl = snapshot?.config.baseUrl;
 
   useEffect(() => {
@@ -322,7 +338,13 @@ export function App() {
       async onStartRun() {
         setPendingAction("run-all");
         try {
-          setFlashMessage(await requestAction("/api/run/manual", { preferredBaseUrl }));
+          const trimmed = falabellaDocumentsSearchFrom.trim();
+          setFlashMessage(
+            await requestAction("/api/run/manual", {
+              preferredBaseUrl,
+              body: trimmed ? { falabellaDocumentsSearchFrom: trimmed } : {},
+            }),
+          );
           refresh();
         } finally {
           setPendingAction(null);
@@ -373,7 +395,7 @@ export function App() {
         }
       },
     }),
-    [preferredBaseUrl, refresh],
+    [preferredBaseUrl, refresh, falabellaDocumentsSearchFrom],
   );
 
   return (
@@ -396,6 +418,8 @@ export function App() {
       onRetry={(attemptId) => void actions.onRetry(attemptId)}
       pendingAction={pendingAction}
       deletingRunId={deletingRunId}
+      falabellaDocumentsSearchFrom={falabellaDocumentsSearchFrom}
+      onFalabellaDocumentsSearchFromChange={setFalabellaDocumentsSearchFrom}
     />
   );
 }

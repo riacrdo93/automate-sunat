@@ -9,6 +9,7 @@ import {
   toneForStatus,
 } from "../lib/dashboard";
 import { StatusChip } from "./status-chip";
+import { ExpandableLogMessage } from "./expandable-log-message";
 
 type StageDetailProps = {
   run: DashboardRunRecord;
@@ -103,7 +104,11 @@ export function StageDetail({ run, snapshot, stage }: StageDetailProps) {
                         <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-slate-500">
                           Ultimo evento
                         </p>
-                        <p className="text-sm leading-6 text-slate-700">{latestLog.message}</p>
+                        <ExpandableLogMessage
+                          text={latestLog.message}
+                          preWrap
+                          className="text-sm leading-6 text-slate-700"
+                        />
                         <p className="text-xs uppercase tracking-[0.18em] text-slate-400">
                           {formatDate(latestLog.at)}
                           {latestLog.saleExternalId ? ` · ${latestLog.saleExternalId}` : ""}

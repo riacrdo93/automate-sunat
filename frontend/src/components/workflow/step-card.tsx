@@ -2,6 +2,7 @@ import { HighlightedJson } from "../json-highlight";
 import { Badge, Card, CardContent, CardHeader, CardTitle, Tabs, TabsContent, TabsList, TabsTrigger } from "./primitives";
 import type { StepOutput, StepStatus, SubStep, WorkflowStepView } from "./types";
 import { cx, statusLabel, statusTone } from "./utils";
+import { ExpandableLogMessage } from "../expandable-log-message";
 
 export interface StepCardProps {
   step: WorkflowStepView;
@@ -99,7 +100,7 @@ function LogsList({ logs }: { logs: WorkflowStepView["logs"] }) {
     info: "text-slate-700",
     warn: "text-amber-700",
     error: "text-rose-700",
-    debug: "text-slate-500",
+    debug: "text-sky-600/90 dark:text-sky-400/80",
   };
 
   return (
@@ -112,9 +113,17 @@ function LogsList({ logs }: { logs: WorkflowStepView["logs"] }) {
           >
             <span className="shrink-0 text-white/45">{log.timestamp}</span>
             <span className={cx("shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-[0.18em]", levelStyles[log.level], "bg-white/5")}>
-              {log.level}
+              {log.level === "debug" ? "dbg" : log.level}
             </span>
-            <span className="break-words font-mono text-white/80">{log.message}</span>
+            <ExpandableLogMessage
+              text={log.message}
+              preWrap={log.level === "debug"}
+              expandTone="invert"
+              className={cx(
+                "break-words font-mono text-white/80",
+                log.level === "debug" && "text-sky-200/90",
+              )}
+            />
           </div>
         ))}
       </div>

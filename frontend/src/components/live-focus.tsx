@@ -13,6 +13,7 @@ import {
   resolveUpcomingAction,
 } from "../lib/dashboard";
 import { StatusChip } from "./status-chip";
+import { ExpandableLogMessage } from "./expandable-log-message";
 import { WorkflowStepper } from "./workflow-stepper";
 
 type LiveFocusProps = {
@@ -59,9 +60,11 @@ export function LiveFocus({ snapshot, run, onOpenInspector, onApprove, onCancel 
                 <h2 className="text-2xl font-semibold tracking-[-0.04em] text-slate-950 sm:text-[2rem]">
                   {focusedStep?.title ?? "Flujo en ejecucion"}
                 </h2>
-                <p className="max-w-3xl text-sm leading-6 text-slate-600">
-                  {latestLog?.message ?? snapshot.runtime.currentStep ?? "La corrida sigue avanzando."}
-                </p>
+                <ExpandableLogMessage
+                  text={latestLog?.message ?? snapshot.runtime.currentStep ?? "La corrida sigue avanzando."}
+                  containerClassName="max-w-3xl"
+                  className="text-sm leading-6 text-slate-600"
+                />
               </div>
             </div>
 
@@ -177,9 +180,12 @@ export function LiveFocus({ snapshot, run, onOpenInspector, onApprove, onCancel 
                   <p className="mt-2 text-sm font-semibold text-white">
                     {focusedStep?.title ?? "Sin paso activo"}
                   </p>
-                  <p className="mt-2 text-sm leading-6 text-white/68">
-                    {latestLog?.message ?? "La corrida sigue esperando la siguiente senal del flujo."}
-                  </p>
+                  <ExpandableLogMessage
+                    text={latestLog?.message ?? "La corrida sigue esperando la siguiente senal del flujo."}
+                    expandTone="invert"
+                    containerClassName="mt-2"
+                    className="text-sm leading-6 text-white/68"
+                  />
                 </div>
 
                 <div className="grid gap-3">

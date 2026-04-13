@@ -35,7 +35,32 @@ const envSchema = z.object({
   SUNAT_USERNAME: z.string().default(""),
   SUNAT_PASSWORD: z.string().default(""),
   SUNAT_RUC: z.string().default(""),
+  /** YYYY-MM-DD (fecha local). Vacío: en Falabella no se abre el filtro de fechas (se usa el rango ya mostrado). */
+  FALABELLA_DOCUMENTS_SEARCH_FROM: z.string().optional().default(""),
 });
+
+/** Normaliza fecha de inicio para búsqueda en Documentos tributarios (Falabella). Vacío o solo espacios → undefined. */
+export function normalizeFalabellaDocumentsSearchFromIso(raw: string | undefined): string | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+  const t = raw.trim();
+  if (!t) {
+    return undefined;
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(t)) {
+    throw new Error(`La fecha de inicio debe ser YYYY-MM-DD; recibí "${raw}".`);
+  }
+  const [y, m, d] = t.split("-").map((p) => parseInt(p, 10));
+  if (![y, m, d].every((n) => Number.isFinite(n))) {
+    throw new Error(`La fecha de inicio no es válida: "${raw}".`);
+  }
+  const dt = new Date(y, m - 1, d);
+  if (dt.getFullYear() !== y || dt.getMonth() + 1 !== m || dt.getDate() !== d) {
+    throw new Error(`Fecha de calendario inválida: "${raw}".`);
+  }
+  return t;
+}
 
 export interface AppConfig {
   port: number;
@@ -57,6 +82,8 @@ export interface AppConfig {
     username: string;
     password: string;
   };
+  /** Inicio de barrido por fechas en Falabella (YYYY-MM-DD). Sin valor: no se interactúa con el date picker. */
+  falabellaDocumentsSearchFrom?: string;
   dataPaths: {
     rootDir: string;
     dbPath: string;
@@ -82,6 +109,14 @@ export function loadConfig(overrides: Partial<NodeJS.ProcessEnv> = {}): AppConfi
     throw new Error("SITE_PROFILE_PATH es obligatorio.");
   }
 
+  let falabellaDocumentsSearchFrom: string | undefined;
+  try {
+    falabellaDocumentsSearchFrom = normalizeFalabellaDocumentsSearchFromIso(parsed.FALABELLA_DOCUMENTS_SEARCH_FROM);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "FALABELLA_DOCUMENTS_SEARCH_FROM inválida.";
+    throw new Error(`Config: ${message}`);
+  }
+
   const config: AppConfig = {
     port: parsed.APP_PORT,
     appBaseUrl,
@@ -102,6 +137,7 @@ export function loadConfig(overrides: Partial<NodeJS.ProcessEnv> = {}): AppConfi
       username: parsed.SUNAT_USERNAME,
       password: parsed.SUNAT_PASSWORD,
     },
+    falabellaDocumentsSearchFrom,
     dataPaths: {
       rootDir,
       dbPath: path.join(rootDir, "automation.db"),

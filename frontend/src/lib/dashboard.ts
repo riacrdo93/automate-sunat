@@ -318,7 +318,13 @@ export function describeLogContext(run: DashboardRunRecord, log: WorkflowLogEntr
 }
 
 export function labelForLogLevel(level: WorkflowLogEntry["level"]): string {
-  return level === "error" ? "ERROR" : "INFO";
+  if (level === "error") {
+    return "ERROR";
+  }
+  if (level === "debug") {
+    return "DBG";
+  }
+  return "INFO";
 }
 
 export function resolveSelectedStageId(

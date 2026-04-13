@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import express from "express";
 import { AutomationCoordinator } from "./coordinator";
+import { normalizeFalabellaDocumentsSearchFromIso } from "./config";
 
 const LOCAL_DASHBOARD_ORIGIN = /^https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?$/i;
 
@@ -40,8 +41,23 @@ export function createServer(coordinator: AutomationCoordinator): express.Expres
     res.json(coordinator.getSnapshot());
   });
 
-  app.post("/api/run/manual", async (_req, res) => {
-    const result = await coordinator.triggerManualRun();
+  app.post("/api/run/manual", async (req, res) => {
+    let falabellaDocumentsSearchFromIso: string | undefined;
+    try {
+      falabellaDocumentsSearchFromIso = normalizeFalabellaDocumentsSearchFromIso(
+        typeof req.body?.falabellaDocumentsSearchFrom === "string"
+          ? req.body.falabellaDocumentsSearchFrom
+          : undefined,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Fecha de inicio inválida.";
+      res.status(400).json({ started: false, message });
+      return;
+    }
+
+    const result = await coordinator.triggerManualRun({
+      falabellaDocumentsSearchFromIso,
+    });
     res.status(result.started ? 202 : 409).json(result);
   });
 

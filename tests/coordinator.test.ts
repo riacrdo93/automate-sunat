@@ -17,12 +17,12 @@ import { createTempDataDir, waitUntil } from "./helpers";
 class FakeSellerSource implements SellerSource {
   constructor(private readonly sales: Sale[]) {}
 
-  async fetchSales(onStep: StepReporter): Promise<Sale[]> {
+   async fetchSales(onStep: StepReporter, _options?: unknown): Promise<Sale[]> {
     await onStep("Sincronizando cookies del seller");
     return this.sales;
   }
 
-  async refreshSale(externalId: string, onStep: StepReporter): Promise<Sale | undefined> {
+  async refreshSale(externalId: string, onStep: StepReporter, _options?: unknown): Promise<Sale | undefined> {
     await onStep(`Refrescando venta ${externalId}`);
     return this.sales.find((sale) => sale.externalId === externalId);
   }
@@ -37,7 +37,7 @@ class BlockingSellerSource implements SellerSource {
 
   constructor(private readonly sales: Sale[]) {}
 
-  async fetchSales(onStep: StepReporter): Promise<Sale[]> {
+  async fetchSales(onStep: StepReporter, _options?: unknown): Promise<Sale[]> {
     await onStep("Sincronizando cookies del seller");
     await new Promise<void>((resolve) => {
       this.releaseFetch = resolve;
@@ -45,7 +45,7 @@ class BlockingSellerSource implements SellerSource {
     return this.sales;
   }
 
-  async refreshSale(externalId: string, onStep: StepReporter): Promise<Sale | undefined> {
+  async refreshSale(externalId: string, onStep: StepReporter, _options?: unknown): Promise<Sale | undefined> {
     await onStep(`Refrescando venta ${externalId}`);
     return this.sales.find((sale) => sale.externalId === externalId);
   }
