@@ -544,6 +544,9 @@ export class FalabellaSellerSource implements SellerSource {
 }
 
 export class SunatPortalEmitter implements InvoiceEmitter {
+  private sunatSession?: { browser: Browser; context: BrowserContext };
+  private sunatSessionPromise?: Promise<{ browser: Browser; context: BrowserContext }>;
+
   constructor(
     private readonly config: AppConfig,
     private readonly profile: SiteProfile,
@@ -557,28 +560,9 @@ export class SunatPortalEmitter implements InvoiceEmitter {
   ): Promise<PreparedSubmission> {
     await onStep(`Abriendo el portal SUNAT para ${draft.saleExternalId}`);
 
-    const browser = await chromium.launch({
-      headless: !this.config.headful,
-      slowMo: this.config.slowMoMs,
-    });
-    const browserContext = await this.newContext(browser, "sunat.json");
-    await onStep(
-      "[sunat-modal-trace] Modal «Valida tus datos de contacto» (SUNAT): vigilancia activa. Se busca en la página el bloque #divModalCampana y el iframe #ifrVCE; el contenido del iframe es otra web (p. ej. ww1.sunat.gob.pe), por eso el mismo script se vuelve a ejecutar dentro de ese iframe al cargar — allí están los botones. Cada 3 s se revisa. Textos largos = diagnóstico; avisos cortos al cerrar = info.",
-    );
+    const { browser, context: browserContext } = await this.getOrCreateSunatSession();
     const page = await browserContext.newPage();
-    const sunatModalLogPrefix = "[automate-sunat:sunat-modal] ";
-    const sunatModalTracePrefix = "[automate-sunat:sunat-modal-trace] ";
-    page.on("console", (msg) => {
-      const text = msg.text();
-      if (text.startsWith(sunatModalTracePrefix)) {
-        void onStep(`[sunat-modal-trace] ${text.slice(sunatModalTracePrefix.length)}`);
-        return;
-      }
-      if (!text.startsWith(sunatModalLogPrefix)) {
-        return;
-      }
-      void onStep(text.slice(sunatModalLogPrefix.length));
-    });
+    startSunatValidationIframeSearchLogger(page, onStep);
     const tracePath = path.join(this.config.dataPaths.tracesDir, `${attemptId}.zip`);
     const preSubmitScreenshot = path.join(
       this.config.dataPaths.screenshotsDir,
@@ -743,10 +727,22 @@ export class SunatPortalEmitter implements InvoiceEmitter {
         }
       }
       await stopTraceSafely(browserContext, tracePath, artifacts);
-      await browserContext.close().catch(() => undefined);
-      await browser.close().catch(() => undefined);
+      await page.close().catch(() => undefined);
       throw normalizeAutomationError(error, artifacts);
     }
+  }
+
+  async close(): Promise<void> {
+    const session = this.sunatSession ?? (await this.sunatSessionPromise?.catch(() => undefined));
+    this.sunatSession = undefined;
+    this.sunatSessionPromise = undefined;
+
+    if (!session) {
+      return;
+    }
+
+    await session.context.close().catch(() => undefined);
+    await session.browser.close().catch(() => undefined);
   }
 
   private async loginIfNeeded(page: Page, onStep: StepReporter): Promise<void> {
@@ -769,6 +765,171 @@ export class SunatPortalEmitter implements InvoiceEmitter {
     await installSunatContactValidationModalDismisser(context);
     return context;
   }
+
+  private async getOrCreateSunatSession(): Promise<{ browser: Browser; context: BrowserContext }> {
+    if (this.sunatSession && this.sunatSession.browser.isConnected()) {
+      return this.sunatSession;
+    }
+
+    if (this.sunatSessionPromise) {
+      return this.sunatSessionPromise;
+    }
+
+    this.sunatSessionPromise = (async () => {
+      const browser = await chromium.launch({
+        headless: !this.config.headful,
+        slowMo: this.config.slowMoMs,
+      });
+      const context = await this.newContext(browser, "sunat.json");
+      const session = { browser, context };
+
+      browser.once("disconnected", () => {
+        if (this.sunatSession?.browser === browser) {
+          this.sunatSession = undefined;
+        }
+      });
+      context.once("close", () => {
+        if (this.sunatSession?.context === context) {
+          this.sunatSession = undefined;
+        }
+      });
+
+      this.sunatSession = session;
+      return session;
+    })();
+
+    try {
+      return await this.sunatSessionPromise;
+    } finally {
+      this.sunatSessionPromise = undefined;
+    }
+  }
+}
+
+function startSunatValidationIframeSearchLogger(page: Page, onStep: StepReporter): void {
+  const POLL_INTERVAL_MS = 1_500;
+
+  void (async () => {
+    while (!page.isClosed()) {
+      try {
+        await onStep("SUNAT: buscando iframe #ifrVCE");
+        const found = await page
+          .evaluate(() => {
+            const insideModal = document.querySelector("#divModalCampana #ifrVCE");
+            if (insideModal instanceof HTMLIFrameElement) {
+              return true;
+            }
+
+            const globalIframe = document.getElementById("ifrVCE");
+            return globalIframe instanceof HTMLIFrameElement;
+          })
+          .catch(() => false);
+        await onStep(found ? "SUNAT: iframe #ifrVCE encontrado" : "SUNAT: iframe #ifrVCE no encontrado");
+        if (found) {
+          await onStep("SUNAT: iframe #ifrVCE encontrado; esperaré 1s antes de buscar los botones.");
+          await page.waitForTimeout(1_000).catch(() => undefined);
+          const finalized = await tryClickSunatValidationFinalizeButton(page, onStep);
+
+          if (!finalized) {
+            await onStep(
+              "ERROR SUNAT: falló #btnFinalizarValidacionDatos; no cerraré el modal en este intento.",
+            );
+            continue;
+          }
+
+          const continued = await tryClickSunatValidationContinueWithoutConfirmButton(page, onStep);
+
+          if (!continued) {
+            await onStep("ERROR SUNAT: falló #btnCerrar; el modal sigue abierto.");
+            continue;
+          }
+
+          if (finalized && continued) {
+            await onStep("SUNAT: iframe resuelto; detengo la búsqueda del modal.");
+            return;
+          }
+        }
+      } catch {
+        return;
+      }
+
+      await page.waitForTimeout(POLL_INTERVAL_MS).catch(() => undefined);
+    }
+  })();
+}
+
+async function tryClickSunatValidationFinalizeButton(
+  page: Page,
+  onStep: StepReporter,
+): Promise<boolean> {
+  await onStep("SUNAT: buscando #btnFinalizarValidacionDatos dentro del iframe");
+
+  for (const frame of page.frames()) {
+    const hasButton = await frame
+      .evaluate(() => Boolean(document.getElementById("btnFinalizarValidacionDatos")))
+      .catch(() => false);
+
+    if (!hasButton) {
+      continue;
+    }
+
+    const finalizeButton = frame.locator("#btnFinalizarValidacionDatos").first();
+    const isVisible = await finalizeButton.isVisible().catch(() => false);
+
+    if (!isVisible) {
+      await onStep("SUNAT: #btnFinalizarValidacionDatos encontrado en el iframe, pero no esta visible");
+      return false;
+    }
+
+    await onStep("SUNAT: #btnFinalizarValidacionDatos encontrado; haré click");
+    await finalizeButton.scrollIntoViewIfNeeded().catch(() => undefined);
+    const clicked = await finalizeButton.click().then(() => true).catch(() => false);
+    if (!clicked) {
+      await onStep("SUNAT: falló el click en #btnFinalizarValidacionDatos; seguiré buscando.");
+      return false;
+    }
+    await page.waitForTimeout(250).catch(() => undefined);
+    return true;
+  }
+
+  await onStep("SUNAT: #btnFinalizarValidacionDatos no encontrado dentro del iframe");
+  return false;
+}
+
+async function tryClickSunatValidationContinueWithoutConfirmButton(
+  page: Page,
+  onStep: StepReporter,
+): Promise<boolean> {
+  await onStep("SUNAT: buscando #btnCerrar dentro del iframe");
+
+  for (const frame of page.frames()) {
+    const hasButton = await frame.evaluate(() => Boolean(document.getElementById("btnCerrar"))).catch(() => false);
+
+    if (!hasButton) {
+      continue;
+    }
+
+    const closeButton = frame.locator("#btnCerrar").first();
+    const isVisible = await closeButton.isVisible().catch(() => false);
+
+    if (!isVisible) {
+      await onStep("SUNAT: #btnCerrar encontrado en el iframe, pero no esta visible");
+      return false;
+    }
+
+    await onStep("SUNAT: #btnCerrar encontrado; haré click en Continuar sin confirmar");
+    await closeButton.scrollIntoViewIfNeeded().catch(() => undefined);
+    const clicked = await closeButton.click().then(() => true).catch(() => false);
+    if (!clicked) {
+      await onStep("SUNAT: falló el click en #btnCerrar; seguiré buscando.");
+      return false;
+    }
+    await page.waitForTimeout(250).catch(() => undefined);
+    return true;
+  }
+
+  await onStep("SUNAT: #btnCerrar no encontrado dentro del iframe");
+  return false;
 }
 
 class PendingSunatSubmission implements PreparedSubmission {
@@ -848,12 +1009,12 @@ class PendingSunatSubmission implements PreparedSubmission {
         const acceptButton = await waitForVisibleLocatorInPageTree(
           this.params.page,
           this.params.profile.sunat.confirmAcceptSelector,
-          10_000,
+          1500,
         );
         await onStep(`Botón Aceptar encontrado (${await describeLocatorIdentity(acceptButton.locator)}); haré click.`);
         await acceptButton.locator.click();
         await onStep("Click en Aceptar realizado; esperando el comprobante emitido.");
-        await waitForSunatProcessingToSettle(this.params.page, "la confirmación de emisión", onStep, 30_000);
+        await waitForSunatProcessingToSettle(this.params.page, "la confirmación de emisión", onStep, 5000);
         await this.params.page.waitForTimeout(750);
       }
 
@@ -967,8 +1128,6 @@ class PendingSunatSubmission implements PreparedSubmission {
     if (!this.params.page.isClosed()) {
       await this.params.page.close().catch(() => undefined);
     }
-    await this.params.context.close().catch(() => undefined);
-    await this.params.browser.close().catch(() => undefined);
   }
 }
 
@@ -3695,8 +3854,7 @@ async function navigateSunatSolMenu(page: Page, labels: string[], onStep: StepRe
  * Cierra en segundo plano el flujo «Valida tus datos de contacto» (modal informativo + «Continuar sin confirmar»).
  * Debe ejecutarse en cada marco: la campaña suele cargarse en un iframe cross-origin (p. ej. ifrVCE → ww1.sunat.gob.pe);
  * desde el top no se puede leer ese documento, pero addInitScript corre también al cargar el iframe.
- * Traza: prefijo [automate-sunat:sunat-modal-trace] → nivel debug en dashboard. Cierre de modal: [automate-sunat:sunat-modal] → info.
- * Al instalarse en cada marco se emite un bloque «Vigilante instalado…» (TOP vs IFRAME).
+ * Emite logs simples de búsqueda/cierre para que el dashboard muestre el estado real del iframe y del modal.
  */
 async function installSunatContactValidationModalDismisser(context: BrowserContext): Promise<void> {
   await context.addInitScript(() => {
@@ -3711,24 +3869,12 @@ async function installSunatContactValidationModalDismisser(context: BrowserConte
     }
     win[installKey] = true;
 
-    const LOG_PREFIX = "[automate-sunat:sunat-modal] ";
-    const TRACE_PREFIX = "[automate-sunat:sunat-modal-trace] ";
     let tickSeq = 0;
+    const POLL_INTERVAL_MS = 1_500;
+    const POLL_INTERVAL_LABEL = "1.5 s";
 
-    function logStep(message: string): void {
-      try {
-        console.log(`${LOG_PREFIX}${message}`);
-      } catch {
-        /* ignore */
-      }
-    }
-
-    function logTraceBlock(lines: string[]): void {
-      try {
-        console.log(`${TRACE_PREFIX}${lines.join("\n")}`);
-      } catch {
-        /* ignore */
-      }
+    function logTraceBlock(_lines: string[]): void {
+      /* trace logging intentionally disabled; keep simple live logs only */
     }
 
     (function logInstallBanner(): void {
@@ -3801,38 +3947,13 @@ async function installSunatContactValidationModalDismisser(context: BrowserConte
       return true;
     }
 
-    function dispatchClick(el: HTMLElement, view: Window): void {
-      try {
-        el.click();
-        return;
-      } catch {
-        /* ignore */
-      }
-      try {
-        el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view }));
-      } catch {
-        /* ignore */
-      }
+    function hideBlockingSurface(el: HTMLElement, trace: string[], label: string): void {
+      el.setAttribute("aria-hidden", "true");
+      el.style.setProperty("visibility", "hidden", "important");
+      el.style.setProperty("opacity", "0", "important");
+      el.style.setProperty("pointer-events", "none", "important");
+      trace.push(`   · ${label}: oculto visualmente (visibility:hidden, opacity:0, pointer-events:none).`);
     }
-
-    function tryCallHide(winLike: Window | null): void {
-      if (!winLike) {
-        return;
-      }
-      try {
-        const fn = (winLike as unknown as { callHide?: () => void }).callHide;
-        if (typeof fn === "function") {
-          fn();
-        }
-      } catch {
-        /* ignore */
-      }
-    }
-
-    const presence = {
-      sawFinalizarModal: false,
-      sawCerrarModal: false,
-    };
 
     function tryDismissContactValidationModals(): void {
       tickSeq += 1;
@@ -3848,7 +3969,7 @@ async function installSunatContactValidationModalDismisser(context: BrowserConte
 
       const trace: string[] = [];
       trace.push(
-        `[cada 3 s] Ciclo #${tickSeq} — se ejecuta el método de vigilancia (setInterval 3000 ms). En este ciclo busco: en TOP → #divModalCampana y iframe id="ifrVCE"; en cada marco → botones del modal.`,
+        `[cada ${POLL_INTERVAL_LABEL}] Ciclo #${tickSeq} — se ejecuta el método de vigilancia (setInterval ${POLL_INTERVAL_MS} ms). En este ciclo busco: en TOP → #divModalCampana y iframe id="ifrVCE"; en cada marco → botones del modal.`,
       );
       trace.push(
         `Paso 0 · Marco: ${isTop ? "TOP (ventana principal)" : "IFRAME/submarco"} · host=${host || "?"} · ruta=${pathSnippet || "?"}`,
@@ -3860,11 +3981,9 @@ async function installSunatContactValidationModalDismisser(context: BrowserConte
       );
       if (!sunatOk) {
         trace.push(
-          `Fin ciclo #${tickSeq} · próxima pasada del mismo método en ~3 s (setInterval 3000 ms). En host SUNAT se buscaría #ifrVCE en TOP.`,
+          `Fin ciclo #${tickSeq} · próxima pasada del mismo método en ~${POLL_INTERVAL_LABEL} (setInterval ${POLL_INTERVAL_MS} ms). En host SUNAT se buscaría #ifrVCE en TOP.`,
         );
         logTraceBlock(trace);
-        presence.sawFinalizarModal = false;
-        presence.sawCerrarModal = false;
         return;
       }
 
@@ -3887,6 +4006,7 @@ async function installSunatContactValidationModalDismisser(context: BrowserConte
               );
               const inTree = document.documentElement.contains(divModalCampana);
               trace.push(`   · conectado al documento actual: ${inTree ? "sí" : "no"}`);
+              hideBlockingSurface(divModalCampana, trace, "#divModalCampana");
             }
           }
 
@@ -3918,7 +4038,7 @@ async function installSunatContactValidationModalDismisser(context: BrowserConte
 
           if (!ifrVce) {
             trace.push(
-              "RESULTADO búsqueda id=\"ifrVCE\": NO ENCONTRADO en el DOM de esta página (TOP). No hay ningún elemento con id ifrVCE todavía, o estás en otra vista. El mismo método volverá a buscar en ~3 s.",
+              `RESULTADO búsqueda id="ifrVCE": NO ENCONTRADO en el DOM de esta página (TOP). No hay ningún elemento con id ifrVCE todavía, o estás en otra vista. El mismo método volverá a buscar en ~${POLL_INTERVAL_LABEL}.`,
             );
           } else {
             const nm = ifrVce.getAttribute("name") || "";
@@ -3928,6 +4048,7 @@ async function installSunatContactValidationModalDismisser(context: BrowserConte
             trace.push(`   · detalle: id=ifrVCE name=${nm || "—"}`);
             const srcAttr = (ifrVce.getAttribute("src") || "").slice(0, 160);
             trace.push(`   · src (recortado): ${srcAttr || "(vacío)"}`);
+            hideBlockingSurface(ifrVce, trace, 'iframe #ifrVCE');
             let access = "";
             try {
               access = ifrVce.contentDocument
@@ -3978,11 +4099,9 @@ async function installSunatContactValidationModalDismisser(context: BrowserConte
       } catch (e) {
         trace.push(`Paso 3 · Error recopilando documentos same-origin: ${String((e as Error)?.message || e)}`);
         trace.push(
-          `Fin ciclo #${tickSeq} · próxima pasada del mismo método en ~3 s (setInterval 3000 ms).`,
+          `Fin ciclo #${tickSeq} · próxima pasada del mismo método en ~${POLL_INTERVAL_LABEL} (setInterval ${POLL_INTERVAL_MS} ms).`,
         );
         logTraceBlock(trace);
-        presence.sawFinalizarModal = false;
-        presence.sawCerrarModal = false;
         return;
       }
       trace.push(`Paso 3 · Documentos same-origin desde este marco: ${docs.length}`);
@@ -4039,70 +4158,13 @@ async function installSunatContactValidationModalDismisser(context: BrowserConte
       }
 
       trace.push(
-        `Fin ciclo #${tickSeq} · próxima pasada del mismo método en ~3 s (setInterval 3000 ms; en TOP SUNAT se vuelve a buscar id="ifrVCE").`,
+        `Fin ciclo #${tickSeq} · próxima pasada del mismo método en ~${POLL_INTERVAL_LABEL} (setInterval ${POLL_INTERVAL_MS} ms; en TOP SUNAT se vuelve a buscar id="ifrVCE").`,
       );
       logTraceBlock(trace);
 
-      for (let d = 0; d < docs.length; d += 1) {
-        const doc = docs[d];
-        const docView = doc.defaultView;
-        if (!docView) {
-          continue;
-        }
-
-        const finalizar = doc.getElementById("btnFinalizarValidacionDatos");
-        if (finalizar instanceof HTMLElement && elementLooksVisibleInDocument(finalizar, doc)) {
-          if (!presence.sawFinalizarModal) {
-            presence.sawFinalizarModal = true;
-            logStep(
-              "SUNAT validación datos: apareció el modal «Informativo» (btnFinalizarValidacionDatos); cierro con Finalizar.",
-            );
-          }
-          dispatchClick(finalizar, docView);
-          return;
-        }
-      }
-      presence.sawFinalizarModal = false;
-
-      for (let d = 0; d < docs.length; d += 1) {
-        const doc = docs[d];
-        const docView = doc.defaultView;
-        if (!docView) {
-          continue;
-        }
-
-        const cerrar = doc.getElementById("btnCerrar");
-        if (!(cerrar instanceof HTMLElement) || !elementLooksVisibleInDocument(cerrar, doc)) {
-          continue;
-        }
-
-        const onclick = cerrar.getAttribute("onclick") || "";
-        const label = (cerrar.textContent || "").replace(/\s+/g, " ").trim();
-        if (!(onclick.includes("callHide") || /continuar\s+sin\s+confirmar/i.test(label))) {
-          continue;
-        }
-
-        if (!presence.sawCerrarModal) {
-          presence.sawCerrarModal = true;
-          logStep(
-            'SUNAT validación datos: apareció «Continuar sin confirmar» (btnCerrar); cierro y llamo callHide si existe.',
-          );
-        }
-        dispatchClick(cerrar, docView);
-        tryCallHide(docView);
-        return;
-      }
-      presence.sawCerrarModal = false;
     }
 
-    (function logTimerRegistered(): void {
-      const lines = [
-        "Timer registrado: window.setInterval(…, 3000). La función de vigilancia se ejecuta ahora (1.ª vez) y luego cada 3000 ms; en cada ciclo en TOP SUNAT se intenta localizar #divModalCampana e iframe id=\"ifrVCE\".",
-      ];
-      logTraceBlock(lines);
-    })();
-
-    window.setInterval(tryDismissContactValidationModals, 3_000);
+    window.setInterval(tryDismissContactValidationModals, POLL_INTERVAL_MS);
     tryDismissContactValidationModals();
   });
 }
@@ -4473,6 +4535,18 @@ async function selectSunatInicioTipoDocumentoSinDocumento(page: Page, onStep?: S
   }
 
   async function openDropdown(): Promise<void> {
+    const arrow = widgetLoc.locator(".dijitDownArrowButton, .dijitArrowButton, .dijitArrowButtonContainer").first();
+
+    if (await arrow.isVisible().catch(() => false)) {
+      await onStep?.("SUNAT: clic en la flecha del combo de tipo de documento para abrir el combobox.");
+      await arrow.scrollIntoViewIfNeeded().catch(() => undefined);
+      await arrow.click({ timeout: 12_000 }).catch(async () => {
+        await onStep?.("SUNAT: reintento clic en la flecha del combo (force).");
+        await arrow.click({ force: true, timeout: 8_000 }).catch(() => undefined);
+      });
+      return;
+    }
+
     await onStep?.(
       "SUNAT: clic en el campo id=inicio.tipoDocumento (input/combo) para abrir la lista de opciones.",
     );
@@ -4515,7 +4589,7 @@ async function selectSunatInicioTipoDocumentoSinDocumento(page: Page, onStep?: S
     return;
   }
 
-  const arrow = widgetLoc.locator(".dijitDownArrowButton, .dijitArrowButton, .dijitArrowButtonInner").first();
+  const arrow = widgetLoc.locator(".dijitDownArrowButton, .dijitArrowButton, .dijitArrowButtonContainer").first();
   if (await arrow.isVisible().catch(() => false)) {
     await onStep?.("SUNAT: abro con la flecha del combo.");
     await arrow.click().catch(() => undefined);
@@ -4908,6 +4982,17 @@ async function tryRecoverSunatInconsistentIdentityModal(
   }
 
   await page.waitForTimeout(1_000);
+  await prepareSunatCustomerWithoutDocument(page, profile, draft.customer.name, onStep);
+
+  return true;
+}
+
+async function prepareSunatCustomerWithoutDocument(
+  page: Page,
+  profile: SiteProfile,
+  customerName: string,
+  onStep?: StepReporter,
+): Promise<{ scope: PageScope; locator: Locator }> {
   await selectSunatInicioTipoDocumentoSinDocumento(page, onStep);
   await page.waitForTimeout(400);
 
@@ -4927,10 +5012,31 @@ async function tryRecoverSunatInconsistentIdentityModal(
     await page.waitForTimeout(200);
   }
 
-  await nameField.locator.fill(draft.customer.name);
-  await nameField.locator.press("Tab").catch(() => undefined);
+  if (await nameField.locator.isEditable().catch(() => false)) {
+    await onStep?.("SUNAT: campo nombre habilitado; escribiré el nombre del cliente.");
+    await nameField.locator.click().catch(() => undefined);
+    await nameField.locator.fill(customerName);
+    await nameField.locator.press("Tab").catch(() => undefined);
+    return nameField;
+  }
 
-  return true;
+  await onStep?.("SUNAT: el campo nombre sigue bloqueado; aplicaré respaldo DOM para escribirlo igual.");
+  await nameField.locator.evaluate((element, value) => {
+    if (!(element instanceof HTMLInputElement)) {
+      throw new Error("El campo de nombre no es un input.");
+    }
+
+    element.removeAttribute("disabled");
+    element.removeAttribute("aria-disabled");
+    element.disabled = false;
+    element.value = value;
+    element.setAttribute("value", value);
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+    element.dispatchEvent(new Event("blur", { bubbles: true }));
+  }, customerName);
+
+  return nameField;
 }
 
 function collectPageScopes(page: Page): PageScope[] {

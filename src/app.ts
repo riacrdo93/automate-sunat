@@ -26,6 +26,7 @@ export function createAppContext(config: AppConfig) {
     coordinator,
     close: async () => {
       await coordinator.stop();
+      await emitter.close();
       store.close();
     },
   };
