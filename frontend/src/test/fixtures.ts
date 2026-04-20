@@ -187,11 +187,23 @@ const baseSnapshot: DashboardSnapshot = {
     headful: false,
     baseUrl: "http://localhost:3030",
   },
+  accounts: [
+    {
+      id: "account-default",
+      label: "Principal",
+      sellerUsername: "atencion@limbo.pe",
+      sunatRuc: "20607809136",
+      sunatUsername: "EGURECOl",
+      createdAt: "2026-03-01T10:00:00.000Z",
+      updatedAt: "2026-03-01T10:00:00.000Z",
+    },
+  ],
   runtime: {
     isRunning: true,
     currentRunId: "run-live",
     currentSaleId: "ORDER-1001",
     currentStep: "Exportando JSON de ventas",
+    currentAccountId: "account-default",
     lastCheckAt: "2026-03-28T15:10:00.000Z",
     nextCheckAt: "2026-03-28T15:40:00.000Z",
     currentWorkflowStageId: "detectar_ventas",
@@ -230,6 +242,7 @@ const baseSnapshot: DashboardSnapshot = {
 
 type SnapshotOverrides = {
   config?: Partial<DashboardSnapshot["config"]>;
+  accounts?: DashboardSnapshot["accounts"];
   runtime?: Partial<DashboardSnapshot["runtime"]>;
   runs?: DashboardRunRecord[];
   sales?: DashboardSnapshot["sales"];

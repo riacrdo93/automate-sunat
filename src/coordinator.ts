@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   AutomationError,
+  FetchSalesOptions,
   InvoiceEmitter,
   OperatorCancelledError,
   PreparedSubmission,
@@ -19,6 +20,9 @@ import {
   WorkflowStepStatus,
 } from "./domain";
 import { RunStore } from "./store";
+
+/** Prefijo en mensajes de `onStep` que se guardan como nivel `debug` (traza del vigilante de modales SUNAT). */
+const SUNAT_MODAL_TRACE_LOG_PREFIX = "[sunat-modal-trace] ";
 
 type ApprovalDecision = "approve" | "cancel";
 
@@ -66,6 +70,7 @@ export class AutomationCoordinator {
     currentRunId: undefined as string | undefined,
     currentSaleId: undefined as string | undefined,
     currentStep: "En espera",
+    currentAccountId: undefined as string | undefined,
     lastCheckAt: undefined as string | undefined,
     nextCheckAt: undefined as string | undefined,
     currentWorkflowStageId: undefined as string | undefined,
@@ -77,8 +82,28 @@ export class AutomationCoordinator {
     private readonly store: RunStore,
     private readonly sellerSource: SellerSource,
     private readonly invoiceEmitter: InvoiceEmitter,
+    private readonly resolveAccountConfig: (accountId?: string) => AppConfig,
   ) {
     this.refreshNextCheckAt();
+  }
+
+  listAccounts() {
+    return this.store.listAccounts();
+  }
+
+  createAccount(input: {
+    label: string;
+    sellerUsername: string;
+    sellerPassword: string;
+    sunatRuc: string;
+    sunatUsername: string;
+    sunatPassword: string;
+  }) {
+    return this.store.createAccount(input);
+  }
+
+  deleteAccount(accountId: string) {
+    return this.store.deleteAccount(accountId);
   }
 
   start(): void {
@@ -88,9 +113,9 @@ export class AutomationCoordinator {
       }
 
       const intervalMs = this.config.checkIntervalMinutes * 60 * 1000;
-      this.launchRun("hourly");
+      this.launchRun("hourly", undefined, false, this.falabellaFetchOptionsFromConfig());
       this.interval = setInterval(() => {
-        this.launchRun("hourly");
+        this.launchRun("hourly", undefined, false, this.falabellaFetchOptionsFromConfig());
       }, intervalMs);
       this.refreshNextCheckAt();
       this.publish();
@@ -113,16 +138,19 @@ export class AutomationCoordinator {
     this.publish();
   }
 
-  async triggerManualRun(): Promise<{ started: boolean; message: string }> {
+  async triggerManualRun(options?: {
+    accountId?: string;
+    fetchSalesOptions?: FetchSalesOptions;
+  }): Promise<{ started: boolean; message: string }> {
     if (this.runInFlight) {
       return { started: false, message: "Ya hay una ejecución en progreso." };
     }
 
-    this.launchRun("manual");
+    this.launchRun("manual", undefined, false, options?.fetchSalesOptions, options?.accountId);
     return { started: true, message: "Ejecución iniciada." };
   }
 
-  async triggerStepTwoRun(): Promise<{ started: boolean; message: string }> {
+  async triggerStepTwoRun(options?: { accountId?: string }): Promise<{ started: boolean; message: string }> {
     if (this.runInFlight) {
       return { started: false, message: "Ya hay una ejecución en progreso." };
     }
@@ -136,7 +164,7 @@ export class AutomationCoordinator {
       };
     }
 
-    this.launchRun("step2", reusableSales, true);
+    this.launchRun("step2", reusableSales, true, undefined, options?.accountId);
     return {
       started: true,
       message: `Paso 2 iniciado con ${reusableSales.length} venta(s) guardada(s) del paso 1.`,
@@ -164,7 +192,7 @@ export class AutomationCoordinator {
       return { started: false, message: "Ya hay una ejecución en progreso." };
     }
 
-    this.launchRun("retry", [sale]);
+    this.launchRun("retry", [sale], false, this.falabellaFetchOptionsFromConfig(), this.runtime.currentAccountId);
     return { started: true, message: "Reintento iniciado." };
   }
 
@@ -226,6 +254,7 @@ export class AutomationCoordinator {
         headful: this.config.headful,
         baseUrl: this.config.appBaseUrl,
       },
+      accounts: dashboardData.accounts,
       runtime: {
         ...this.runtime,
         pendingApprovals: dashboardData.attempts
@@ -247,10 +276,28 @@ export class AutomationCoordinator {
     };
   }
 
+  private falabellaFetchOptionsFromConfig(): FetchSalesOptions {
+    const fromIso = this.config.falabellaDocumentsSearchFrom;
+    const toIso = this.config.falabellaDocumentsSearchTo;
+
+    if (fromIso && toIso) {
+      return { falabellaDocumentsSearchFromIso: fromIso, falabellaDocumentsSearchToIso: toIso };
+    }
+    if (fromIso) {
+      return { falabellaDocumentsSearchFromIso: fromIso };
+    }
+    if (toIso) {
+      return { falabellaDocumentsSearchToIso: toIso };
+    }
+    return {};
+  }
+
   private async run(
     reason: RunReason,
     retrySales?: Sale[],
     stepTwoOnly = false,
+    fetchSalesOptions?: FetchSalesOptions,
+    accountId?: string,
   ): Promise<{ started: boolean; message: string }> {
     if (this.runInFlight) {
       return { started: false, message: "Ya hay una ejecución en progreso." };
@@ -258,6 +305,7 @@ export class AutomationCoordinator {
 
     this.runInFlight = true;
     this.runtime.isRunning = true;
+    this.runtime.currentAccountId = accountId;
     this.runtime.currentStep =
       reason === "retry"
         ? "Reintentando venta fallida"
@@ -271,6 +319,7 @@ export class AutomationCoordinator {
 
     try {
       this.runtime.lastCheckAt = new Date().toISOString();
+      const runConfig = this.resolveAccountConfig(accountId);
       let observedSales: Sale[] = [];
       let salesForSunat: Sale[] = [];
 
@@ -293,10 +342,12 @@ export class AutomationCoordinator {
           const refreshedSale = await this.sellerSource.refreshSale(
             targetSale.externalId,
             this.stepReporter(targetSale.externalId),
+            fetchSalesOptions,
           );
           observedSales = refreshedSale ? [refreshedSale] : retrySales;
         } else {
-          observedSales = retrySales ?? (await this.sellerSource.fetchSales(this.stepReporter()));
+          observedSales =
+            retrySales ?? (await this.sellerSource.fetchSales(this.stepReporter(), fetchSalesOptions));
         }
         this.currentRunProgress().summary.observedSales = observedSales.length;
         this.advanceWorkflow(
@@ -335,7 +386,7 @@ export class AutomationCoordinator {
       }
 
       if ((stepTwoOnly || this.config.autoContinueStepTwo) && salesForSunat.length > 0) {
-        await this.processSunatRegistrations(salesForSunat);
+        await this.processSunatRegistrations(salesForSunat, runConfig);
       } else if (salesForSunat.length > 0) {
         this.appendRunLog({
           level: "info",
@@ -391,6 +442,7 @@ export class AutomationCoordinator {
       this.runtime.currentRunId = undefined;
       this.runtime.currentSaleId = undefined;
       this.runtime.currentStep = "En espera";
+      this.runtime.currentAccountId = undefined;
       this.runtime.currentWorkflowStageId = undefined;
       this.runtime.currentWorkflowStepId = undefined;
       this.runInFlight = false;
@@ -399,7 +451,7 @@ export class AutomationCoordinator {
     }
   }
 
-  private async processSunatRegistrations(sales: Sale[]): Promise<void> {
+  private async processSunatRegistrations(sales: Sale[], runConfig: AppConfig): Promise<void> {
     const runId = this.runtime.currentRunId;
     if (!runId) {
       return;
@@ -558,8 +610,14 @@ export class AutomationCoordinator {
     }
   }
 
-  private launchRun(reason: RunReason, retrySales?: Sale[], stepTwoOnly = false): void {
-    const trackedPromise = this.run(reason, retrySales, stepTwoOnly).finally(() => {
+  private launchRun(
+    reason: RunReason,
+    retrySales?: Sale[],
+    stepTwoOnly = false,
+    fetchSalesOptions?: FetchSalesOptions,
+    accountId?: string,
+  ): void {
+    const trackedPromise = this.run(reason, retrySales, stepTwoOnly, fetchSalesOptions, accountId).finally(() => {
       if (this.activeRunPromise === trackedPromise) {
         this.activeRunPromise = undefined;
       }
@@ -599,7 +657,14 @@ export class AutomationCoordinator {
 
   private stepReporter(saleExternalId?: string): StepReporter {
     return async (step: string) => {
-      this.runtime.currentStep = step;
+      if (step.startsWith(SUNAT_MODAL_TRACE_LOG_PREFIX)) {
+        const body = step.slice(SUNAT_MODAL_TRACE_LOG_PREFIX.length);
+        const head = body.split("\n")[0] ?? body;
+        this.runtime.currentStep =
+          head.length > 120 ? `〈Traza modal SUNAT〉 ${head.slice(0, 117)}…` : `〈Traza modal SUNAT〉 ${head}`;
+      } else {
+        this.runtime.currentStep = step;
+      }
       if (saleExternalId) {
         this.runtime.currentSaleId = saleExternalId;
       }
@@ -691,7 +756,7 @@ export class AutomationCoordinator {
   }
 
   private appendRunLog(entry: {
-    level: "info" | "error";
+    level: "info" | "error" | "debug";
     stageId: string;
     stepId: string;
     message: string;
@@ -879,6 +944,9 @@ export class AutomationCoordinator {
   }
 
   private recordWorkflowStep(step: string, saleExternalId?: string): void {
+    const isSunatModalTrace = step.startsWith(SUNAT_MODAL_TRACE_LOG_PREFIX);
+    const messageForLog = isSunatModalTrace ? step.slice(SUNAT_MODAL_TRACE_LOG_PREFIX.length) : step;
+
     const target = this.resolveWorkflowStepTarget(step);
 
     if (target) {
@@ -895,10 +963,10 @@ export class AutomationCoordinator {
       ?? currentStage?.steps[0];
 
     this.appendRunLog({
-      level: "info",
+      level: isSunatModalTrace ? "debug" : "info",
       stageId: currentStage?.id ?? "detectar_ventas",
       stepId: currentStep?.id ?? "abrir_falabella",
-      message: step,
+      message: messageForLog,
       saleExternalId,
     });
     this.syncRunProgress();

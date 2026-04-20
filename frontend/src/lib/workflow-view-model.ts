@@ -42,7 +42,13 @@ function mapStatus(status: WorkflowStepStatus): WorkflowStatusView {
 }
 
 function mapLogLevel(level: WorkflowLogEntry["level"]): WorkflowLogView["level"] {
-  return level === "error" ? "error" : "info";
+  if (level === "error") {
+    return "error";
+  }
+  if (level === "debug") {
+    return "debug";
+  }
+  return "info";
 }
 
 function formatDuration(start?: string, end?: string): string {

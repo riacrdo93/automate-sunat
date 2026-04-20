@@ -15,6 +15,17 @@ function WorkspaceHarness({
     config: {
       autoContinueStepTwo,
     },
+    accounts: [
+      {
+        id: "account-1",
+        label: "Principal",
+        sellerUsername: "seller@example.com",
+        sunatRuc: "20600000000",
+        sunatUsername: "SOLUSER",
+        createdAt: "2026-03-28T15:00:00.000Z",
+        updatedAt: "2026-03-28T15:00:00.000Z",
+      },
+    ],
     runtime: {
       isRunning,
       currentRunId: isRunning ? "run-live" : undefined,
@@ -32,6 +43,9 @@ function WorkspaceHarness({
 
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [selectedStageId, setSelectedStageId] = useState<string | null>(null);
+  const [falabellaDocumentsSearchFrom, setFalabellaDocumentsSearchFrom] = useState("");
+  const [falabellaDocumentsSearchTo, setFalabellaDocumentsSearchTo] = useState("");
+  const selectedAccountId = snapshot.accounts[0]?.id ?? null;
 
   return (
     <DashboardWorkspace
@@ -53,6 +67,16 @@ function WorkspaceHarness({
       onRetry={vi.fn()}
       pendingAction={null}
       deletingRunId={null}
+      falabellaDocumentsSearchFrom={falabellaDocumentsSearchFrom}
+      onFalabellaDocumentsSearchFromChange={setFalabellaDocumentsSearchFrom}
+      falabellaDocumentsSearchTo={falabellaDocumentsSearchTo}
+      onFalabellaDocumentsSearchToChange={setFalabellaDocumentsSearchTo}
+      accounts={snapshot.accounts}
+      selectedAccountId={selectedAccountId}
+      onSelectAccountId={vi.fn()}
+      onCreateAccount={vi.fn()}
+      onDeleteAccount={vi.fn()}
+      onClearFalabellaDocumentsSearchRange={vi.fn()}
     />
   );
 }
@@ -136,6 +160,16 @@ describe("DashboardWorkspace", () => {
         onRetry={vi.fn()}
         pendingAction={null}
         deletingRunId={null}
+        falabellaDocumentsSearchFrom=""
+        onFalabellaDocumentsSearchFromChange={vi.fn()}
+        falabellaDocumentsSearchTo=""
+        onFalabellaDocumentsSearchToChange={vi.fn()}
+        accounts={[]}
+        selectedAccountId={null}
+        onSelectAccountId={vi.fn()}
+        onCreateAccount={vi.fn()}
+        onDeleteAccount={vi.fn()}
+        onClearFalabellaDocumentsSearchRange={vi.fn()}
       />,
     );
 
@@ -149,6 +183,17 @@ describe("DashboardWorkspace", () => {
         snapshot={
           createSnapshot({
             runs: [],
+            accounts: [
+              {
+                id: "account-1",
+                label: "Principal",
+                sellerUsername: "seller@example.com",
+                sunatRuc: "20600000000",
+                sunatUsername: "SOLUSER",
+                createdAt: "2026-03-28T15:00:00.000Z",
+                updatedAt: "2026-03-28T15:00:00.000Z",
+              },
+            ],
             runtime: {
               isRunning: false,
               currentRunId: undefined,
@@ -181,6 +226,26 @@ describe("DashboardWorkspace", () => {
         onRetry={vi.fn()}
         pendingAction={null}
         deletingRunId={null}
+        falabellaDocumentsSearchFrom=""
+        onFalabellaDocumentsSearchFromChange={vi.fn()}
+        falabellaDocumentsSearchTo=""
+        onFalabellaDocumentsSearchToChange={vi.fn()}
+        accounts={[
+          {
+            id: "account-1",
+            label: "Principal",
+            sellerUsername: "seller@example.com",
+            sunatRuc: "20600000000",
+            sunatUsername: "SOLUSER",
+            createdAt: "2026-03-28T15:00:00.000Z",
+            updatedAt: "2026-03-28T15:00:00.000Z",
+          },
+        ]}
+        selectedAccountId={"account-1"}
+        onSelectAccountId={vi.fn()}
+        onCreateAccount={vi.fn()}
+        onDeleteAccount={vi.fn()}
+        onClearFalabellaDocumentsSearchRange={vi.fn()}
       />,
     );
 
@@ -198,6 +263,17 @@ describe("DashboardWorkspace", () => {
       <DashboardWorkspace
         snapshot={
           createSnapshot({
+            accounts: [
+              {
+                id: "account-1",
+                label: "Principal",
+                sellerUsername: "seller@example.com",
+                sunatRuc: "20600000000",
+                sunatUsername: "SOLUSER",
+                createdAt: "2026-03-28T15:00:00.000Z",
+                updatedAt: "2026-03-28T15:00:00.000Z",
+              },
+            ],
             runtime: {
               isRunning: false,
               currentRunId: undefined,
@@ -230,6 +306,26 @@ describe("DashboardWorkspace", () => {
         onRetry={vi.fn()}
         pendingAction={null}
         deletingRunId={null}
+        falabellaDocumentsSearchFrom=""
+        onFalabellaDocumentsSearchFromChange={vi.fn()}
+        falabellaDocumentsSearchTo=""
+        onFalabellaDocumentsSearchToChange={vi.fn()}
+        accounts={[
+          {
+            id: "account-1",
+            label: "Principal",
+            sellerUsername: "seller@example.com",
+            sunatRuc: "20600000000",
+            sunatUsername: "SOLUSER",
+            createdAt: "2026-03-28T15:00:00.000Z",
+            updatedAt: "2026-03-28T15:00:00.000Z",
+          },
+        ]}
+        selectedAccountId={"account-1"}
+        onSelectAccountId={vi.fn()}
+        onCreateAccount={vi.fn()}
+        onDeleteAccount={vi.fn()}
+        onClearFalabellaDocumentsSearchRange={vi.fn()}
       />,
     );
 

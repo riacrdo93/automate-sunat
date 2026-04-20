@@ -3,6 +3,7 @@ import { useMemo } from "react";
 import type { DashboardRunRecord } from "@shared/dashboard-contract";
 import { describeLogContext, formatLogTime, labelForLogLevel, toneForStatus } from "../lib/dashboard";
 import { StatusChip } from "./status-chip";
+import { ExpandableLogMessage } from "./expandable-log-message";
 import { useStickToBottomScroll } from "../hooks/use-stick-to-bottom-scroll";
 
 type LogsDisclosureProps = {
@@ -52,7 +53,12 @@ export function LogsDisclosure({ run, selectedStageId }: LogsDisclosureProps) {
                         <Kbd className="font-mono">
                           {formatLogTime(log.at)}
                         </Kbd>
-                        <StatusChip className="font-mono" tone={log.level === "error" ? "danger" : "success"}>
+                        <StatusChip
+                          className="font-mono"
+                          tone={
+                            log.level === "error" ? "danger" : log.level === "debug" ? "neutral" : "success"
+                          }
+                        >
                           {labelForLogLevel(log.level)}
                         </StatusChip>
                         <StatusChip className="font-mono" tone="neutral">{context.stageLabel}</StatusChip>
@@ -60,7 +66,15 @@ export function LogsDisclosure({ run, selectedStageId }: LogsDisclosureProps) {
                         {log.saleExternalId ? <StatusChip className="font-mono" tone="neutral">{log.saleExternalId}</StatusChip> : null}
                       </div>
 
-                      <p className="break-words font-mono text-sm leading-6 text-default-700">{log.message}</p>
+                      <ExpandableLogMessage
+                        text={log.message}
+                        preWrap={log.level === "debug"}
+                        className={
+                          log.level === "debug"
+                            ? "break-words font-mono text-sm leading-6 text-sky-800 dark:text-sky-300"
+                            : "break-words font-mono text-sm leading-6 text-default-700"
+                        }
+                      />
                     </Card.Content>
                   </Card>
                 );

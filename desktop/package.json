@@ -1,0 +1,23 @@
+{
+  "name": "automate-sunat-desktop",
+  "private": true,
+  "version": "1.0.1",
+  "type": "commonjs",
+  "main": "dist/src/main.js",
+  "scripts": {
+    "dev": "cross-env NODE_ENV=development ELECTRON_IS_DEV=1 electron dist/src/main.js",
+    "generate-icons": "node tools/generate-icons.cjs",
+    "build": "tsc -p tsconfig.json",
+    "package": "npm run generate-icons && npm run build && electron-builder"
+  },
+  "devDependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "@types/node": "^25.5.0",
+    "cross-env": "^7.0.3",
+    "electron": "^38.0.0",
+    "electron-builder": "^26.0.16",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2",
+    "wait-on": "^8.0.5"
+  }
+}

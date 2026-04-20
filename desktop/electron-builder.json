@@ -1,0 +1,22 @@
+{
+  "appId": "com.automate-sunat.desktop",
+  "productName": "Automate SUNAT",
+  "directories": {
+    "output": "release"
+  },
+  "files": [
+    "dist/**"
+  ],
+  "extraResources": [],
+  "asar": true,
+  "linux": {
+    "icon": "assets/icons",
+    "target": ["AppImage"]
+  },
+  "mac": {
+    "target": ["dmg"]
+  },
+  "win": {
+    "target": ["nsis"]
+  }
+}

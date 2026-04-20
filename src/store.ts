@@ -4,6 +4,7 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import {
   Artifact,
+  AutomationAccountSummary,
   DashboardRunEntry,
   DashboardRunRecord,
   InvoiceAttemptRecord,
@@ -53,6 +54,18 @@ type RunRow = {
   ended_at: string | null;
 };
 
+type AccountRow = {
+  id: string;
+  label: string;
+  seller_username: string;
+  seller_password: string;
+  sunat_ruc: string;
+  sunat_username: string;
+  sunat_password: string;
+  created_at: string;
+  updated_at: string;
+};
+
 export class RunStore {
   private readonly db: Database.Database;
   private readonly dbPath: string;
@@ -67,6 +80,190 @@ export class RunStore {
 
   close(): void {
     this.db.close();
+  }
+
+  listAccounts(): AutomationAccountSummary[] {
+    const rows = this.db
+      .prepare(
+        `
+        SELECT id, label, seller_username, sunat_ruc, sunat_username, created_at, updated_at
+        FROM accounts
+        ORDER BY updated_at DESC, created_at DESC
+      `,
+      )
+      .all() as Array<{
+      id: string;
+      label: string;
+      seller_username: string;
+      sunat_ruc: string;
+      sunat_username: string;
+      created_at: string;
+      updated_at: string;
+    }>;
+
+    return rows.map((row) => ({
+      id: row.id,
+      label: row.label,
+      sellerUsername: row.seller_username,
+      sunatRuc: row.sunat_ruc,
+      sunatUsername: row.sunat_username,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }));
+  }
+
+  getAccountCredentials(accountId: string): {
+    sellerCredentials: { username: string; password: string };
+    sunatCredentials: { ruc: string; username: string; password: string };
+  } | undefined {
+    const row = this.db
+      .prepare(
+        `
+        SELECT seller_username, seller_password, sunat_ruc, sunat_username, sunat_password
+        FROM accounts
+        WHERE id = ?
+      `,
+      )
+      .get(accountId) as
+      | {
+          seller_username: string;
+          seller_password: string;
+          sunat_ruc: string;
+          sunat_username: string;
+          sunat_password: string;
+        }
+      | undefined;
+
+    if (!row) {
+      return undefined;
+    }
+
+    return {
+      sellerCredentials: {
+        username: row.seller_username,
+        password: row.seller_password,
+      },
+      sunatCredentials: {
+        ruc: row.sunat_ruc,
+        username: row.sunat_username,
+        password: row.sunat_password,
+      },
+    };
+  }
+
+  createAccount(input: {
+    label: string;
+    sellerUsername: string;
+    sellerPassword: string;
+    sunatRuc: string;
+    sunatUsername: string;
+    sunatPassword: string;
+  }): AutomationAccountSummary {
+    const id = randomUUID();
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `
+        INSERT INTO accounts (
+          id, label,
+          seller_username, seller_password,
+          sunat_ruc, sunat_username, sunat_password,
+          created_at, updated_at
+        )
+        VALUES (
+          @id, @label,
+          @seller_username, @seller_password,
+          @sunat_ruc, @sunat_username, @sunat_password,
+          @created_at, @updated_at
+        )
+      `,
+      )
+      .run({
+        id,
+        label: input.label.trim(),
+        seller_username: input.sellerUsername.trim(),
+        seller_password: input.sellerPassword,
+        sunat_ruc: input.sunatRuc.trim(),
+        sunat_username: input.sunatUsername.trim(),
+        sunat_password: input.sunatPassword,
+        created_at: now,
+        updated_at: now,
+      });
+
+    return {
+      id,
+      label: input.label.trim(),
+      sellerUsername: input.sellerUsername.trim(),
+      sunatRuc: input.sunatRuc.trim(),
+      sunatUsername: input.sunatUsername.trim(),
+      createdAt: now,
+      updatedAt: now,
+    };
+  }
+
+  deleteAccount(accountId: string): { deleted: boolean; message: string } {
+    const existing = this.db
+      .prepare(
+        `
+        SELECT id
+        FROM accounts
+        WHERE id = ?
+      `,
+      )
+      .get(accountId) as { id: string } | undefined;
+
+    if (!existing) {
+      return { deleted: false, message: "La cuenta ya no existe." };
+    }
+
+    this.db
+      .prepare(
+        `
+        DELETE FROM accounts
+        WHERE id = ?
+      `,
+      )
+      .run(accountId);
+
+    return { deleted: true, message: "Cuenta eliminada." };
+  }
+
+  ensureDefaultAccountFromEnv(input: {
+    label: string;
+    sellerUsername: string;
+    sellerPassword: string;
+    sunatRuc: string;
+    sunatUsername: string;
+    sunatPassword: string;
+  }): void {
+    const count = this.db.prepare("SELECT COUNT(1) as c FROM accounts").get() as { c: number };
+    if ((count.c ?? 0) > 0) {
+      return;
+    }
+
+    if (!input.sellerUsername || !input.sunatUsername || !input.sunatRuc) {
+      return;
+    }
+
+    this.createAccount(input);
+  }
+
+  buildAppConfigFromAccount(baseConfig: {
+    sellerCredentials: { username: string; password: string };
+    sunatCredentials: { ruc: string; username: string; password: string };
+  }, accountId?: string): typeof baseConfig {
+    if (!accountId) {
+      return baseConfig;
+    }
+    const credentials = this.getAccountCredentials(accountId);
+    if (!credentials) {
+      return baseConfig;
+    }
+    return {
+      ...baseConfig,
+      sellerCredentials: credentials.sellerCredentials,
+      sunatCredentials: credentials.sunatCredentials,
+    };
   }
 
   registerObservedSales(sales: Sale[]): Sale[] {
@@ -488,10 +685,12 @@ export class RunStore {
   }
 
   getDashboardData(limit = 25): {
+    accounts: AutomationAccountSummary[];
     sales: SaleRecordSummary[];
     attempts: InvoiceAttemptRecord[];
     runs: DashboardRunRecord[];
   } {
+    const accounts = this.listAccounts();
     const sales = this.db
       .prepare(
         `
@@ -588,7 +787,7 @@ export class RunStore {
         };
       });
 
-    return { sales, attempts, runs };
+    return { accounts, sales, attempts, runs };
   }
 
   private getRunEntriesForRun(runId: string): DashboardRunEntry[] {
@@ -776,6 +975,18 @@ export class RunStore {
         summary_json TEXT NOT NULL DEFAULT '{}',
         started_at TEXT NOT NULL,
         ended_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS accounts (
+        id TEXT PRIMARY KEY,
+        label TEXT NOT NULL,
+        seller_username TEXT NOT NULL,
+        seller_password TEXT NOT NULL,
+        sunat_ruc TEXT NOT NULL,
+        sunat_username TEXT NOT NULL,
+        sunat_password TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
       );
     `);
 

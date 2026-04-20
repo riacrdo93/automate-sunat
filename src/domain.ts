@@ -4,6 +4,7 @@ import type { InvoiceDraft, Sale } from "../shared/dashboard-contract";
 export type {
   Artifact,
   AttemptStatus,
+  AutomationAccountSummary,
   CustomerData,
   DashboardRunEntry,
   DashboardRunRecord,
