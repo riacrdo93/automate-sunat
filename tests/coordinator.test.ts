@@ -188,6 +188,7 @@ describe("AutomationCoordinator", () => {
       store,
       new FakeSellerSource([]),
       new FakeEmitter(),
+      (accountId) => config,
     ));
 
     const runPromise = currentCoordinator.triggerManualRun();
@@ -235,6 +236,24 @@ describe("AutomationCoordinator", () => {
       store,
       new FakeSellerSource([sale]),
       new FakeEmitter(),
+      (accountId) => {
+        if (!accountId) {
+          return config;
+        }
+        const credentials = store.getAccountCredentials(accountId);
+        if (!credentials) {
+          return config;
+        }
+        return {
+          ...config,
+          sellerCredentials: credentials.sellerCredentials,
+          sunatCredentials: credentials.sunatCredentials,
+          dataPaths: {
+            ...config.dataPaths,
+            authDir: path.join(config.dataPaths.authDir, `account-${accountId}`),
+          },
+        };
+      },
     ));
 
     const runPromise = currentCoordinator.triggerManualRun();
@@ -294,6 +313,20 @@ describe("AutomationCoordinator", () => {
       store,
       new FakeSellerSource([sale]),
       new FakeEmitter(),
+      (accountId) => {
+        if (!accountId) {
+          return config;
+        }
+        const credentials = store.getAccountCredentials(accountId);
+        if (!credentials) {
+          return config;
+        }
+        return {
+          ...config,
+          sellerCredentials: credentials.sellerCredentials,
+          sunatCredentials: credentials.sunatCredentials,
+        };
+      },
     ));
 
     const runPromise = currentCoordinator.triggerManualRun();
@@ -340,6 +373,20 @@ describe("AutomationCoordinator", () => {
       store,
       new FakeSellerSource([]),
       new FakeEmitter(),
+      (accountId) => {
+        if (!accountId) {
+          return config;
+        }
+        const credentials = store.getAccountCredentials(accountId);
+        if (!credentials) {
+          return config;
+        }
+        return {
+          ...config,
+          sellerCredentials: credentials.sellerCredentials,
+          sunatCredentials: credentials.sunatCredentials,
+        };
+      },
     ));
 
     const runPromise = currentCoordinator.triggerStepTwoRun();
@@ -401,6 +448,7 @@ describe("AutomationCoordinator", () => {
       store,
       new FakeSellerSource([]),
       emitter,
+      (accountId) => config,
     ));
 
     const runPromise = currentCoordinator.triggerStepTwoRun();
@@ -467,6 +515,7 @@ describe("AutomationCoordinator", () => {
       store,
       new FakeSellerSource([saleReady, saleNew]),
       new FakeEmitter(),
+      (_accountId) => config,
     ));
 
     const runPromise = currentCoordinator.triggerManualRun();
@@ -515,6 +564,7 @@ describe("AutomationCoordinator", () => {
       store,
       new FakeSellerSource([]),
       new FakeEmitter(),
+      () => config,
     ));
 
     expect(currentCoordinator.getSnapshot().runtime.stepTwoReady.available).toBe(true);
@@ -559,7 +609,26 @@ describe("AutomationCoordinator", () => {
       SLOW_MO_MS: "0",
       DATA_DIR: dataDir,
     });
-    coordinator = new AutomationCoordinator(config, store, blockingSource, new FakeEmitter());
+    coordinator = new AutomationCoordinator(
+      config,
+      store,
+      blockingSource,
+      new FakeEmitter(),
+      (accountId) => {
+        if (!accountId) {
+          return config;
+        }
+        const credentials = store.getAccountCredentials(accountId);
+        if (!credentials) {
+          return config;
+        }
+        return {
+          ...config,
+          sellerCredentials: credentials.sellerCredentials,
+          sunatCredentials: credentials.sunatCredentials,
+        };
+      },
+    );
 
     const result = await coordinator.triggerManualRun();
 
@@ -582,7 +651,26 @@ describe("AutomationCoordinator", () => {
       SLOW_MO_MS: "0",
       DATA_DIR: dataDir,
     });
-    coordinator = new AutomationCoordinator(config, store, new FakeSellerSource([]), new FakeEmitter());
+    coordinator = new AutomationCoordinator(
+      config,
+      store,
+      new FakeSellerSource([]),
+      new FakeEmitter(),
+      (accountId) => {
+        if (!accountId) {
+          return config;
+        }
+        const credentials = store.getAccountCredentials(accountId);
+        if (!credentials) {
+          return config;
+        }
+        return {
+          ...config,
+          sellerCredentials: credentials.sellerCredentials,
+          sunatCredentials: credentials.sunatCredentials,
+        };
+      },
+    );
 
     coordinator.start();
 

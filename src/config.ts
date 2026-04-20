@@ -62,6 +62,29 @@ export function normalizeFalabellaDocumentsSearchFromIso(raw: string | undefined
   return t;
 }
 
+/** Normaliza fecha fin para búsqueda en Documentos tributarios (Falabella). Vacío o solo espacios → undefined. */
+export function normalizeFalabellaDocumentsSearchToIso(raw: string | undefined): string | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+  const t = raw.trim();
+  if (!t) {
+    return undefined;
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(t)) {
+    throw new Error(`La fecha de fin debe ser YYYY-MM-DD; recibí "${raw}".`);
+  }
+  const [y, m, d] = t.split("-").map((p) => parseInt(p, 10));
+  if (![y, m, d].every((n) => Number.isFinite(n))) {
+    throw new Error(`La fecha de fin no es válida: "${raw}".`);
+  }
+  const dt = new Date(y, m - 1, d);
+  if (dt.getFullYear() !== y || dt.getMonth() + 1 !== m || dt.getDate() !== d) {
+    throw new Error(`Fecha de calendario inválida: "${raw}".`);
+  }
+  return t;
+}
+
 export interface AppConfig {
   port: number;
   appBaseUrl: string;
@@ -84,6 +107,8 @@ export interface AppConfig {
   };
   /** Inicio de barrido por fechas en Falabella (YYYY-MM-DD). Sin valor: no se interactúa con el date picker. */
   falabellaDocumentsSearchFrom?: string;
+  /** Fin de barrido por fechas en Falabella (YYYY-MM-DD). Sin valor: se usa hoy (fecha local). */
+  falabellaDocumentsSearchTo?: string;
   dataPaths: {
     rootDir: string;
     dbPath: string;

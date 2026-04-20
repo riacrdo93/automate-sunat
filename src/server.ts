@@ -2,7 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import express from "express";
 import { AutomationCoordinator } from "./coordinator";
-import { normalizeFalabellaDocumentsSearchFromIso } from "./config";
+import { normalizeFalabellaDocumentsSearchFromIso, normalizeFalabellaDocumentsSearchToIso } from "./config";
+import { z } from "zod";
 
 const LOCAL_DASHBOARD_ORIGIN = /^https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?$/i;
 
@@ -41,28 +42,89 @@ export function createServer(coordinator: AutomationCoordinator): express.Expres
     res.json(coordinator.getSnapshot());
   });
 
+  app.get("/api/accounts", (_req, res) => {
+    res.json({ accounts: coordinator.listAccounts() });
+  });
+
+  app.post("/api/accounts", (req, res) => {
+    const schema = z.object({
+      label: z.string().trim().min(1).max(64),
+      sellerUsername: z.string().trim().min(1).max(256),
+      sellerPassword: z.string().min(1).max(256),
+      sunatRuc: z.string().trim().min(8).max(16),
+      sunatUsername: z.string().trim().min(1).max(64),
+      sunatPassword: z.string().min(1).max(256),
+    });
+
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ ok: false, message: "Datos de cuenta inválidos." });
+      return;
+    }
+
+    const account = coordinator.createAccount(parsed.data);
+    res.status(201).json({ ok: true, account });
+  });
+
+  app.delete("/api/accounts/:accountId", (req, res) => {
+    const accountId = String(req.params.accountId || "");
+    if (!accountId) {
+      res.status(400).json({ ok: false, message: "accountId inválido." });
+      return;
+    }
+    const result = coordinator.deleteAccount(accountId);
+    res.status(result.deleted ? 200 : 409).json(result);
+  });
+
   app.post("/api/run/manual", async (req, res) => {
     let falabellaDocumentsSearchFromIso: string | undefined;
+    let falabellaDocumentsSearchToIso: string | undefined;
     try {
       falabellaDocumentsSearchFromIso = normalizeFalabellaDocumentsSearchFromIso(
         typeof req.body?.falabellaDocumentsSearchFrom === "string"
           ? req.body.falabellaDocumentsSearchFrom
           : undefined,
       );
+      falabellaDocumentsSearchToIso = normalizeFalabellaDocumentsSearchToIso(
+        typeof req.body?.falabellaDocumentsSearchTo === "string"
+          ? req.body.falabellaDocumentsSearchTo
+          : undefined,
+      );
+
+      if (falabellaDocumentsSearchFromIso && falabellaDocumentsSearchToIso) {
+        if (falabellaDocumentsSearchFromIso > falabellaDocumentsSearchToIso) {
+          throw new Error(
+            `La fecha "desde" (${falabellaDocumentsSearchFromIso}) no puede ser mayor que "hasta" (${falabellaDocumentsSearchToIso}).`,
+          );
+        }
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Fecha de inicio inválida.";
       res.status(400).json({ started: false, message });
       return;
     }
 
+    const accountId =
+      typeof req.body?.accountId === "string" && req.body.accountId.trim() ? req.body.accountId.trim() : undefined;
+
     const result = await coordinator.triggerManualRun({
-      falabellaDocumentsSearchFromIso,
+      accountId,
+      fetchSalesOptions:
+        falabellaDocumentsSearchFromIso || falabellaDocumentsSearchToIso
+          ? {
+              falabellaDocumentsSearchFromIso,
+              falabellaDocumentsSearchToIso,
+            }
+          : undefined,
     });
     res.status(result.started ? 202 : 409).json(result);
   });
 
-  app.post("/api/run/step-2", async (_req, res) => {
-    const result = await coordinator.triggerStepTwoRun();
+  app.post("/api/run/step-2", async (req, res) => {
+    const accountId =
+      typeof req.body?.accountId === "string" && req.body.accountId.trim() ? req.body.accountId.trim() : undefined;
+
+    const result = await coordinator.triggerStepTwoRun({ accountId });
     res.status(result.started ? 202 : 409).json(result);
   });
 

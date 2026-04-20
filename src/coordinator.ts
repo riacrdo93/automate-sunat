@@ -70,6 +70,7 @@ export class AutomationCoordinator {
     currentRunId: undefined as string | undefined,
     currentSaleId: undefined as string | undefined,
     currentStep: "En espera",
+    currentAccountId: undefined as string | undefined,
     lastCheckAt: undefined as string | undefined,
     nextCheckAt: undefined as string | undefined,
     currentWorkflowStageId: undefined as string | undefined,
@@ -81,8 +82,28 @@ export class AutomationCoordinator {
     private readonly store: RunStore,
     private readonly sellerSource: SellerSource,
     private readonly invoiceEmitter: InvoiceEmitter,
+    private readonly resolveAccountConfig: (accountId?: string) => AppConfig,
   ) {
     this.refreshNextCheckAt();
+  }
+
+  listAccounts() {
+    return this.store.listAccounts();
+  }
+
+  createAccount(input: {
+    label: string;
+    sellerUsername: string;
+    sellerPassword: string;
+    sunatRuc: string;
+    sunatUsername: string;
+    sunatPassword: string;
+  }) {
+    return this.store.createAccount(input);
+  }
+
+  deleteAccount(accountId: string) {
+    return this.store.deleteAccount(accountId);
   }
 
   start(): void {
@@ -117,16 +138,19 @@ export class AutomationCoordinator {
     this.publish();
   }
 
-  async triggerManualRun(fetchSalesOptions?: FetchSalesOptions): Promise<{ started: boolean; message: string }> {
+  async triggerManualRun(options?: {
+    accountId?: string;
+    fetchSalesOptions?: FetchSalesOptions;
+  }): Promise<{ started: boolean; message: string }> {
     if (this.runInFlight) {
       return { started: false, message: "Ya hay una ejecución en progreso." };
     }
 
-    this.launchRun("manual", undefined, false, fetchSalesOptions);
+    this.launchRun("manual", undefined, false, options?.fetchSalesOptions, options?.accountId);
     return { started: true, message: "Ejecución iniciada." };
   }
 
-  async triggerStepTwoRun(): Promise<{ started: boolean; message: string }> {
+  async triggerStepTwoRun(options?: { accountId?: string }): Promise<{ started: boolean; message: string }> {
     if (this.runInFlight) {
       return { started: false, message: "Ya hay una ejecución en progreso." };
     }
@@ -140,7 +164,7 @@ export class AutomationCoordinator {
       };
     }
 
-    this.launchRun("step2", reusableSales, true);
+    this.launchRun("step2", reusableSales, true, undefined, options?.accountId);
     return {
       started: true,
       message: `Paso 2 iniciado con ${reusableSales.length} venta(s) guardada(s) del paso 1.`,
@@ -168,7 +192,7 @@ export class AutomationCoordinator {
       return { started: false, message: "Ya hay una ejecución en progreso." };
     }
 
-    this.launchRun("retry", [sale], false, this.falabellaFetchOptionsFromConfig());
+    this.launchRun("retry", [sale], false, this.falabellaFetchOptionsFromConfig(), this.runtime.currentAccountId);
     return { started: true, message: "Reintento iniciado." };
   }
 
@@ -230,6 +254,7 @@ export class AutomationCoordinator {
         headful: this.config.headful,
         baseUrl: this.config.appBaseUrl,
       },
+      accounts: dashboardData.accounts,
       runtime: {
         ...this.runtime,
         pendingApprovals: dashboardData.attempts
@@ -252,8 +277,19 @@ export class AutomationCoordinator {
   }
 
   private falabellaFetchOptionsFromConfig(): FetchSalesOptions {
-    const iso = this.config.falabellaDocumentsSearchFrom;
-    return iso ? { falabellaDocumentsSearchFromIso: iso } : {};
+    const fromIso = this.config.falabellaDocumentsSearchFrom;
+    const toIso = this.config.falabellaDocumentsSearchTo;
+
+    if (fromIso && toIso) {
+      return { falabellaDocumentsSearchFromIso: fromIso, falabellaDocumentsSearchToIso: toIso };
+    }
+    if (fromIso) {
+      return { falabellaDocumentsSearchFromIso: fromIso };
+    }
+    if (toIso) {
+      return { falabellaDocumentsSearchToIso: toIso };
+    }
+    return {};
   }
 
   private async run(
@@ -261,6 +297,7 @@ export class AutomationCoordinator {
     retrySales?: Sale[],
     stepTwoOnly = false,
     fetchSalesOptions?: FetchSalesOptions,
+    accountId?: string,
   ): Promise<{ started: boolean; message: string }> {
     if (this.runInFlight) {
       return { started: false, message: "Ya hay una ejecución en progreso." };
@@ -268,6 +305,7 @@ export class AutomationCoordinator {
 
     this.runInFlight = true;
     this.runtime.isRunning = true;
+    this.runtime.currentAccountId = accountId;
     this.runtime.currentStep =
       reason === "retry"
         ? "Reintentando venta fallida"
@@ -281,6 +319,7 @@ export class AutomationCoordinator {
 
     try {
       this.runtime.lastCheckAt = new Date().toISOString();
+      const runConfig = this.resolveAccountConfig(accountId);
       let observedSales: Sale[] = [];
       let salesForSunat: Sale[] = [];
 
@@ -347,7 +386,7 @@ export class AutomationCoordinator {
       }
 
       if ((stepTwoOnly || this.config.autoContinueStepTwo) && salesForSunat.length > 0) {
-        await this.processSunatRegistrations(salesForSunat);
+        await this.processSunatRegistrations(salesForSunat, runConfig);
       } else if (salesForSunat.length > 0) {
         this.appendRunLog({
           level: "info",
@@ -403,6 +442,7 @@ export class AutomationCoordinator {
       this.runtime.currentRunId = undefined;
       this.runtime.currentSaleId = undefined;
       this.runtime.currentStep = "En espera";
+      this.runtime.currentAccountId = undefined;
       this.runtime.currentWorkflowStageId = undefined;
       this.runtime.currentWorkflowStepId = undefined;
       this.runInFlight = false;
@@ -411,7 +451,7 @@ export class AutomationCoordinator {
     }
   }
 
-  private async processSunatRegistrations(sales: Sale[]): Promise<void> {
+  private async processSunatRegistrations(sales: Sale[], runConfig: AppConfig): Promise<void> {
     const runId = this.runtime.currentRunId;
     if (!runId) {
       return;
@@ -575,8 +615,9 @@ export class AutomationCoordinator {
     retrySales?: Sale[],
     stepTwoOnly = false,
     fetchSalesOptions?: FetchSalesOptions,
+    accountId?: string,
   ): void {
-    const trackedPromise = this.run(reason, retrySales, stepTwoOnly, fetchSalesOptions).finally(() => {
+    const trackedPromise = this.run(reason, retrySales, stepTwoOnly, fetchSalesOptions, accountId).finally(() => {
       if (this.activeRunPromise === trackedPromise) {
         this.activeRunPromise = undefined;
       }

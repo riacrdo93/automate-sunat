@@ -20,6 +20,7 @@ import {
 } from "./lib/workflow-view-model";
 import { findActiveRun, findRun } from "./lib/dashboard";
 import { ExpandableLogMessage } from "./components/expandable-log-message";
+import { AccountSelector } from "./components/accounts/account-selector";
 
 const STEP_TWO_STAGE_ID = "registrar_facturas_sunat";
 
@@ -84,6 +85,21 @@ type DashboardWorkspaceProps = {
   deletingRunId?: string | null;
   falabellaDocumentsSearchFrom: string;
   onFalabellaDocumentsSearchFromChange: (value: string) => void;
+  falabellaDocumentsSearchTo: string;
+  onFalabellaDocumentsSearchToChange: (value: string) => void;
+  onClearFalabellaDocumentsSearchRange: () => void;
+  accounts: DashboardSnapshot["accounts"];
+  selectedAccountId: string | null;
+  onSelectAccountId: (accountId: string) => void;
+  onCreateAccount: (input: {
+    label: string;
+    sellerUsername: string;
+    sellerPassword: string;
+    sunatRuc: string;
+    sunatUsername: string;
+    sunatPassword: string;
+  }) => void;
+  onDeleteAccount: (accountId: string) => void;
 };
 
 function StatusMessage({ text }: { text: string }) {
@@ -122,6 +138,13 @@ export function DashboardWorkspace({
   deletingRunId = null,
   falabellaDocumentsSearchFrom,
   onFalabellaDocumentsSearchFromChange,
+  falabellaDocumentsSearchTo,
+  onFalabellaDocumentsSearchToChange,
+  accounts,
+  selectedAccountId,
+  onSelectAccountId,
+  onCreateAccount,
+  onDeleteAccount,
 }: DashboardWorkspaceProps) {
   const [activeStepId, setActiveStepId] = useState<string>("");
   const emptyHeader = {
@@ -165,8 +188,20 @@ export function DashboardWorkspace({
             totalSteps={emptyHeader.totalSteps}
             startLabel={autoContinueStepTwo ? "Ejecutar workflow" : "Ejecutar paso 1"}
             runningLabel={autoContinueStepTwo ? "Workflow en curso" : "Paso 1 en curso"}
+            accountSlot={
+              <AccountSelector
+                accounts={accounts}
+                selectedAccountId={selectedAccountId}
+                isDisabled={snapshot.runtime.isRunning}
+                onSelect={onSelectAccountId}
+                onCreate={onCreateAccount}
+                onDelete={onDeleteAccount}
+              />
+            }
             falabellaDocumentsSearchFrom={falabellaDocumentsSearchFrom}
             onFalabellaDocumentsSearchFromChange={onFalabellaDocumentsSearchFromChange}
+            falabellaDocumentsSearchTo={falabellaDocumentsSearchTo}
+            onFalabellaDocumentsSearchToChange={onFalabellaDocumentsSearchToChange}
             onStartRun={onStartRun}
             onStopRun={onStopRun}
             isRunning={snapshot.runtime.isRunning}
@@ -259,8 +294,20 @@ export function DashboardWorkspace({
         totalSteps={header.totalSteps}
         startLabel={startRunLabel}
         runningLabel={runningRunLabel}
+        accountSlot={
+          <AccountSelector
+            accounts={accounts}
+            selectedAccountId={selectedAccountId}
+            isDisabled={snapshot.runtime.isRunning}
+            onSelect={onSelectAccountId}
+            onCreate={onCreateAccount}
+            onDelete={onDeleteAccount}
+          />
+        }
         falabellaDocumentsSearchFrom={falabellaDocumentsSearchFrom}
         onFalabellaDocumentsSearchFromChange={onFalabellaDocumentsSearchFromChange}
+        falabellaDocumentsSearchTo={falabellaDocumentsSearchTo}
+        onFalabellaDocumentsSearchToChange={onFalabellaDocumentsSearchToChange}
         onStartRun={onStartRun}
         onStopRun={onStopRun}
         isRunning={snapshot.runtime.isRunning}
@@ -317,7 +364,35 @@ export function App() {
   const [pendingAction, setPendingAction] = useState<"run-all" | "step-2" | "stop" | null>(null);
   const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
   const [falabellaDocumentsSearchFrom, setFalabellaDocumentsSearchFrom] = useState("");
+  const [falabellaDocumentsSearchTo, setFalabellaDocumentsSearchTo] = useState("");
+  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(() => {
+    try {
+      return window.localStorage.getItem("automation.accountId");
+    } catch {
+      return null;
+    }
+  });
   const preferredBaseUrl = snapshot?.config.baseUrl;
+
+  const accounts = snapshot?.accounts ?? [];
+  const effectiveAccountId = useMemo(() => {
+    if (selectedAccountId && accounts.some((a) => a.id === selectedAccountId)) {
+      return selectedAccountId;
+    }
+    return accounts[0]?.id ?? null;
+  }, [accounts, selectedAccountId]);
+
+  useEffect(() => {
+    if (!effectiveAccountId) {
+      return;
+    }
+    setSelectedAccountId(effectiveAccountId);
+    try {
+      window.localStorage.setItem("automation.accountId", effectiveAccountId);
+    } catch {
+      // ignore
+    }
+  }, [effectiveAccountId]);
 
   useEffect(() => {
     if (!flashMessage) {
@@ -336,13 +411,22 @@ export function App() {
   const actions = useMemo(
     () => ({
       async onStartRun() {
+        if (!effectiveAccountId) {
+          setFlashMessage("Primero crea una cuenta para ejecutar la automatización.");
+          return;
+        }
         setPendingAction("run-all");
         try {
           const trimmed = falabellaDocumentsSearchFrom.trim();
+          const trimmedTo = falabellaDocumentsSearchTo.trim();
           setFlashMessage(
             await requestAction("/api/run/manual", {
               preferredBaseUrl,
-              body: trimmed ? { falabellaDocumentsSearchFrom: trimmed } : {},
+              body: {
+                accountId: effectiveAccountId,
+                ...(trimmed ? { falabellaDocumentsSearchFrom: trimmed } : {}),
+                ...(trimmedTo ? { falabellaDocumentsSearchTo: trimmedTo } : {}),
+              },
             }),
           );
           refresh();
@@ -360,9 +444,15 @@ export function App() {
         }
       },
       async onStartStepTwo() {
+        if (!effectiveAccountId) {
+          setFlashMessage("Primero crea una cuenta para ejecutar la automatización.");
+          return;
+        }
         setPendingAction("step-2");
         try {
-          setFlashMessage(await requestAction("/api/run/step-2", { preferredBaseUrl }));
+          setFlashMessage(
+            await requestAction("/api/run/step-2", { preferredBaseUrl, body: { accountId: effectiveAccountId } }),
+          );
           refresh();
         } finally {
           setPendingAction(null);
@@ -395,7 +485,7 @@ export function App() {
         }
       },
     }),
-    [preferredBaseUrl, refresh, falabellaDocumentsSearchFrom],
+    [preferredBaseUrl, refresh, falabellaDocumentsSearchFrom, falabellaDocumentsSearchTo, effectiveAccountId],
   );
 
   return (
@@ -420,6 +510,40 @@ export function App() {
       deletingRunId={deletingRunId}
       falabellaDocumentsSearchFrom={falabellaDocumentsSearchFrom}
       onFalabellaDocumentsSearchFromChange={setFalabellaDocumentsSearchFrom}
+      falabellaDocumentsSearchTo={falabellaDocumentsSearchTo}
+      onFalabellaDocumentsSearchToChange={setFalabellaDocumentsSearchTo}
+      onClearFalabellaDocumentsSearchRange={() => {
+        setFalabellaDocumentsSearchFrom("");
+        setFalabellaDocumentsSearchTo("");
+      }}
+      accounts={accounts}
+      selectedAccountId={effectiveAccountId}
+      onSelectAccountId={(id) => {
+        setSelectedAccountId(id);
+        try {
+          window.localStorage.setItem("automation.accountId", id);
+        } catch {
+          // ignore
+        }
+      }}
+      onCreateAccount={async (input) => {
+        try {
+          await requestAction("/api/accounts", { preferredBaseUrl, body: input });
+          refresh();
+        } catch (err) {
+          const message = err instanceof Error ? err.message : "No se pudo crear la cuenta.";
+          setFlashMessage(message);
+        }
+      }}
+      onDeleteAccount={async (accountId) => {
+        try {
+          await requestAction(`/api/accounts/${accountId}`, { preferredBaseUrl, method: "DELETE" });
+          refresh();
+        } catch (err) {
+          const message = err instanceof Error ? err.message : "No se pudo eliminar la cuenta.";
+          setFlashMessage(message);
+        }
+      }}
     />
   );
 }

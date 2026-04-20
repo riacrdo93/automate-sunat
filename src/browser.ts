@@ -22,6 +22,8 @@ export interface SubmissionContext {
 export interface FetchSalesOptions {
   /** Fecha local YYYY-MM-DD. Si falta, no se abre el date picker en Documentos tributarios (Falabella). */
   falabellaDocumentsSearchFromIso?: string;
+  /** Fecha local YYYY-MM-DD. Si falta, se asume "hoy" cuando se usa el filtro de fechas. */
+  falabellaDocumentsSearchToIso?: string;
 }
 
 export interface SellerSource {
@@ -94,17 +96,28 @@ export function falabellaDocumentsTextLooksEmpty(text: string): boolean {
   ].some((pattern) => normalized.includes(pattern));
 }
 
+function accountScopedAuthFileName(accountId: string | undefined, baseFileName: string): string {
+  if (!accountId) {
+    return baseFileName;
+  }
+  const safe = accountId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80);
+  const ext = path.extname(baseFileName);
+  const stem = ext ? baseFileName.slice(0, -ext.length) : baseFileName;
+  return `${stem}-${safe}${ext || ".json"}`;
+}
+
 export class ConfigurableSellerSource implements SellerSource {
   constructor(
     private readonly config: AppConfig,
     private readonly profile: SiteProfile,
+    private readonly accountId?: string,
   ) {}
 
   async fetchSales(onStep: StepReporter, _options?: FetchSalesOptions): Promise<Sale[]> {
     await onStep("Abriendo sesión del navegador para Seller");
 
     const browser = await this.launchBrowser();
-    const context = await this.newContext(browser, "seller.json");
+    const context = await this.newContext(browser, accountScopedAuthFileName(this.accountId, "seller.json"));
     const page = await context.newPage();
 
     try {
@@ -255,7 +268,9 @@ export class ConfigurableSellerSource implements SellerSource {
 
       await onStep(`Revisión del seller completada: ${visitedPages} página(s) inspeccionada(s).`);
 
-      await context.storageState({ path: this.authFile("seller.json") });
+      await context.storageState({
+        path: this.authFile(accountScopedAuthFileName(this.accountId, "seller.json")),
+      });
       return sales;
     } finally {
       await context.close();
@@ -285,7 +300,7 @@ export class ConfigurableSellerSource implements SellerSource {
 
     await onStep(`Capturando evidencia del seller para ${sale.externalId}`);
     const browser = await this.launchBrowser();
-    const context = await this.newContext(browser, "seller.json");
+    const context = await this.newContext(browser, accountScopedAuthFileName(this.accountId, "seller.json"));
     const page = await context.newPage();
 
     try {
@@ -302,7 +317,9 @@ export class ConfigurableSellerSource implements SellerSource {
         `${attemptId}-seller-detail.png`,
       );
       await page.screenshot({ path: screenshotPath, fullPage: true });
-      await context.storageState({ path: this.authFile("seller.json") });
+      await context.storageState({
+        path: this.authFile(accountScopedAuthFileName(this.accountId, "seller.json")),
+      });
       return [{ kind: "screenshot", path: screenshotPath }];
     } finally {
       await context.close();
@@ -432,7 +449,8 @@ export class FalabellaSellerSource implements SellerSource {
       await loginToFalabella(page, this.config.sellerCredentials, onStep, this.config.sellerPurchasedOrdersUrl);
       await openFalabellaDocumentsPage(page, this.config.sellerPurchasedOrdersUrl, onStep);
       const searchFromIso = options?.falabellaDocumentsSearchFromIso;
-      const candidates = await collectFalabellaPendingRowsAcrossPages(page, onStep, searchFromIso);
+      const searchToIso = options?.falabellaDocumentsSearchToIso;
+      const candidates = await collectFalabellaPendingRowsAcrossPages(page, onStep, searchFromIso, searchToIso);
       const sales: Sale[] = [];
 
       for (const candidate of candidates) {
@@ -479,6 +497,7 @@ export class FalabellaSellerSource implements SellerSource {
         externalId,
         onStep,
         options?.falabellaDocumentsSearchFromIso,
+        options?.falabellaDocumentsSearchToIso,
       );
       if (!candidate) {
         return undefined;
@@ -550,6 +569,7 @@ export class SunatPortalEmitter implements InvoiceEmitter {
   constructor(
     private readonly config: AppConfig,
     private readonly profile: SiteProfile,
+    private readonly accountId?: string,
   ) {}
 
   async prepareSubmission(
@@ -780,7 +800,7 @@ export class SunatPortalEmitter implements InvoiceEmitter {
         headless: !this.config.headful,
         slowMo: this.config.slowMoMs,
       });
-      const context = await this.newContext(browser, "sunat.json");
+      const context = await this.newContext(browser, accountScopedAuthFileName(this.accountId, "sunat.json"));
       const session = { browser, context };
 
       browser.once("disconnected", () => {
@@ -2166,6 +2186,7 @@ async function collectFalabellaPendingRowsAcrossPages(
   page: Page,
   onStep: StepReporter,
   searchFromIso?: string,
+  searchToIso?: string,
 ): Promise<FalabellaRowCandidate[]> {
   let ready = await waitForFalabellaDocumentsReadyState(page, onStep);
   if (ready === "timeout") {
@@ -2175,6 +2196,7 @@ async function collectFalabellaPendingRowsAcrossPages(
   }
 
   const todayIso = getFalabellaTodayLocalIso();
+  const effectiveToIso = searchToIso ?? todayIso;
   const collected = new Map<string, FalabellaRowCandidate>();
   let totalVisitedPages = 0;
   let chunkIndex = 0;
@@ -2201,7 +2223,7 @@ async function collectFalabellaPendingRowsAcrossPages(
     return Array.from(collected.values());
   }
 
-  for (const { start, end } of iterateFalabellaDateChunksFromRangeStart(searchFromIso, todayIso)) {
+  for (const { start, end } of iterateFalabellaDateChunksFromRangeStart(searchFromIso, effectiveToIso)) {
     chunkIndex += 1;
     await onStep(
       `Documentos tributarios: bloque ${chunkIndex} (${start}–${end}): ${FALABELLA_DOCUMENTS_DATE_CHUNK_DAYS} días corridos; en el filtro lo parto por mes calendario.`,
@@ -2241,7 +2263,7 @@ async function collectFalabellaPendingRowsAcrossPages(
 
   if (collected.size === 0) {
     await onStep(
-      `Documentos tributarios: barridos de ~30 días desde ${searchFromIso} hasta hoy — sin órdenes con documento pendiente.`,
+      `Documentos tributarios: barridos de ~30 días desde ${searchFromIso} hasta ${effectiveToIso} — sin órdenes con documento pendiente.`,
     );
     return [];
   }
@@ -2257,6 +2279,7 @@ async function findFalabellaPendingRowByOrderIdAcrossPages(
   orderId: string,
   onStep: StepReporter,
   searchFromIso?: string,
+  searchToIso?: string,
 ): Promise<FalabellaRowCandidate | undefined> {
   let ready = await waitForFalabellaDocumentsReadyState(page, onStep);
   if (ready === "timeout") {
@@ -2266,6 +2289,7 @@ async function findFalabellaPendingRowByOrderIdAcrossPages(
   }
 
   const todayIso = getFalabellaTodayLocalIso();
+  const effectiveToIso = searchToIso ?? todayIso;
   let chunkIndex = 0;
 
   if (!searchFromIso) {
@@ -2315,7 +2339,7 @@ async function findFalabellaPendingRowByOrderIdAcrossPages(
     return undefined;
   }
 
-  for (const { start, end } of iterateFalabellaDateChunksFromRangeStart(searchFromIso, todayIso)) {
+  for (const { start, end } of iterateFalabellaDateChunksFromRangeStart(searchFromIso, effectiveToIso)) {
     chunkIndex += 1;
     let partIndex = 0;
     for (const { start: segStart, end: segEnd } of subdivideFalabellaIsoRangeByCalendarMonth(start, end)) {

@@ -145,6 +145,25 @@ export interface DashboardRunRecord extends RunRecordSummary {
   outputJsonContent?: string;
 }
 
+export interface AutomationAccountSummary {
+  id: string;
+  label: string;
+  sellerUsername: string;
+  sunatRuc: string;
+  sunatUsername: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AutomationAccountPayload {
+  label: string;
+  sellerUsername: string;
+  sellerPassword: string;
+  sunatRuc: string;
+  sunatUsername: string;
+  sunatPassword: string;
+}
+
 export interface DashboardSnapshot {
   config: {
     profile: string;
@@ -154,11 +173,13 @@ export interface DashboardSnapshot {
     headful: boolean;
     baseUrl: string;
   };
+  accounts: AutomationAccountSummary[];
   runtime: {
     isRunning: boolean;
     currentRunId?: string;
     currentSaleId?: string;
     currentStep: string;
+    currentAccountId?: string;
     lastCheckAt?: string;
     nextCheckAt?: string;
     currentWorkflowStageId?: string;
