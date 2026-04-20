@@ -1,6 +1,6 @@
 {
   "name": "automate-sunat",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Seller-to-SUNAT browser automation with a live dashboard.",
   "main": "dist/index.js",
   "scripts": {
@@ -8,6 +8,9 @@
     "dev:server": "tsx watch src/index.ts",
     "dev:web": "npm --prefix frontend run dev",
     "dev:web:wait": "node tools/wait-for-server.mjs && npm --prefix frontend run dev",
+    "desktop:dev": "concurrently -k -n app,electron -c blue,green \"npm run dev\" \"wait-on http://127.0.0.1:5173 && npx electron desktop/dist/src/main.js\"",
+    "desktop:start": "concurrently -k -n server,electron -c blue,green \"npm start\" \"wait-on http://127.0.0.1:3030/api/state && npx electron desktop/dist/src/main.js\"",
+    "desktop:package": "npm --prefix desktop run package",
     "start": "npm run build:web && tsx src/index.ts",
     "build:web": "npm --prefix frontend run build",
     "test": "npm run test:server && npm run test:web",
@@ -39,10 +42,13 @@
     "@types/node": "^25.5.0",
     "@types/supertest": "^7.2.0",
     "concurrently": "^9.2.1",
+    "electron": "^37.4.0",
     "supertest": "^7.2.2",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2",
     "vitest": "^4.1.1"
+    ,
+    "wait-on": "^8.0.5"
   },
   "packageManager": "npm@11.12.1"
 }

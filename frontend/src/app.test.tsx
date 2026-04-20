@@ -32,6 +32,7 @@ function WorkspaceHarness({
 
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [selectedStageId, setSelectedStageId] = useState<string | null>(null);
+  const [falabellaDocumentsSearchFrom, setFalabellaDocumentsSearchFrom] = useState("");
 
   return (
     <DashboardWorkspace
@@ -53,6 +54,8 @@ function WorkspaceHarness({
       onRetry={vi.fn()}
       pendingAction={null}
       deletingRunId={null}
+      falabellaDocumentsSearchFrom={falabellaDocumentsSearchFrom}
+      onFalabellaDocumentsSearchFromChange={setFalabellaDocumentsSearchFrom}
     />
   );
 }
@@ -136,6 +139,8 @@ describe("DashboardWorkspace", () => {
         onRetry={vi.fn()}
         pendingAction={null}
         deletingRunId={null}
+        falabellaDocumentsSearchFrom=""
+        onFalabellaDocumentsSearchFromChange={vi.fn()}
       />,
     );
 
@@ -181,6 +186,8 @@ describe("DashboardWorkspace", () => {
         onRetry={vi.fn()}
         pendingAction={null}
         deletingRunId={null}
+        falabellaDocumentsSearchFrom=""
+        onFalabellaDocumentsSearchFromChange={vi.fn()}
       />,
     );
 
@@ -230,6 +237,8 @@ describe("DashboardWorkspace", () => {
         onRetry={vi.fn()}
         pendingAction={null}
         deletingRunId={null}
+        falabellaDocumentsSearchFrom=""
+        onFalabellaDocumentsSearchFromChange={vi.fn()}
       />,
     );
 
