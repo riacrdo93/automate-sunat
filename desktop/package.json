@@ -8,7 +8,7 @@
     "dev": "cross-env NODE_ENV=development ELECTRON_IS_DEV=1 electron dist/src/main.js",
     "generate-icons": "node tools/generate-icons.cjs",
     "build": "tsc -p tsconfig.json",
-    "package": "npm run generate-icons && npm run build && electron-builder"
+    "package": "npm run generate-icons && npm run build && node tools/package.cjs"
   },
   "devDependencies": {
     "@resvg/resvg-js": "^2.6.2",
